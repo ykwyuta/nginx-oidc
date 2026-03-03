@@ -1,8 +1,8 @@
-- [ ] **Phase 1: 設定パーサーと基本構造の構築**
-  - [ ] モジュールの基本ファイル群（`config`、Cソースのスケルトン）の作成
-  - [ ] ロケーションごとの設定構造体（`ngx_http_oidc_loc_conf_t`など）の定義
-  - [ ] `ngx_command_t` によるディレクティブ（`auth_oidc`, `oidc_provider`等）の定義
-  - [ ] モジュールコンテキスト（`ngx_http_module_t`）の定義と設定生成・マージ関数の実装
+- [x] **Phase 1: 設定パーサーと基本構造の構築**
+  - [x] モジュールの基本ファイル群（`config`、Cソースのスケルトン）の作成
+  - [x] ロケーションごとの設定構造体（`ngx_http_oidc_loc_conf_t`など）の定義
+  - [x] `ngx_command_t` によるディレクティブ（`auth_oidc`, `oidc_provider`等）の定義
+  - [x] モジュールコンテキスト（`ngx_http_module_t`）の定義と設定生成・マージ関数の実装
 - [ ] **Phase 2: HTTP非同期通信とディスカバリ**
   IdPとの通信基盤の実装。`.well-known/openid-configuration` のパースとエンドポイントURLの動的解決。
 - [ ] **Phase 3: 認証フローの実装**
