@@ -3,8 +3,10 @@
   - [x] ロケーションごとの設定構造体（`ngx_http_oidc_loc_conf_t`など）の定義
   - [x] `ngx_command_t` によるディレクティブ（`auth_oidc`, `oidc_provider`等）の定義
   - [x] モジュールコンテキスト（`ngx_http_module_t`）の定義と設定生成・マージ関数の実装
-- [ ] **Phase 2: HTTP非同期通信とディスカバリ**
-  IdPとの通信基盤の実装。`.well-known/openid-configuration` のパースとエンドポイントURLの動的解決。
+- [x] **Phase 2: HTTP非同期通信とディスカバリ**
+  - [x] Janssonを用いたJSONレスポンスのパース関数（`ngx_http_oidc_parse_discovery_json`）の実装
+  - [x] NGINXサブリクエストを用いた `.well-known/openid-configuration` の非同期取得（`ngx_http_oidc_start_discovery`, `ngx_http_oidc_discovery_handler`）の実装
+  - [x] OIDCエンドポイント情報の内部構造体への保存
 - [ ] **Phase 3: 認証フローの実装**
   リダイレクト処理、コールバックエンドポイントの処理、トークンの取得（サブリクエスト使用）。
 - [ ] **Phase 4: JWT検証と変数公開**
