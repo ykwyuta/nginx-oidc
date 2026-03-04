@@ -12,7 +12,7 @@
   - [x] コールバックURIからの `code` パラメータの抽出とハンドリングの実装
   - [x] NGINXサブリクエストを用いたトークンエンドポイントからのトークン取得（`ngx_http_oidc_start_token_request`, `ngx_http_oidc_token_handler`）の実装
   - [x] 設定ディレクティブ（`oidc_client_id`, `oidc_client_secret`, `oidc_redirect_uri`）の追加
-- [ ] **Phase 4: JWT検証と変数公開**
+- [x] **Phase 4: JWT検証と変数公開**
   取得したJWTの署名検証と、NGINX内部変数（`$oidc_claim_*`）へのデータエクスポート機能の実装。セッション管理。
 - [ ] **Phase 5: テストと最適化**
   メモリリークの検査、自動テスト（Test::Nginx等を使用）の構築、共有メモリを用いたキャッシュの最適化。
