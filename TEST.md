@@ -2,6 +2,24 @@
 
 サンドボックス環境の制約により、自動テストスクリプトでのE2Eの動作確認が困難なため、以下の項目について手動または結合テスト環境での確認をお願いします。
 
+## モジュールのビルド方法
+
+NGINXソースコードが展開されている環境（例: `/usr/share/nginx/src`）で、以下のコマンドを実行し動的モジュールとしてコンパイルします。
+
+```bash
+# 依存ライブラリのインストール (Ubuntu/Debian系の場合)
+sudo apt-get update
+sudo apt-get install -y nginx-dev libjansson-dev libssl-dev
+
+# NGINXソースディレクトリに移動し、モジュールを追加してコンパイル
+cd /usr/share/nginx/src
+sudo ./configure --with-compat --add-dynamic-module=/app
+sudo make -f objs/Makefile modules
+
+# コンパイルされた .so ファイルを現在のディレクトリへコピー
+cp objs/ngx_http_oidc_module.so /app/
+```
+
 ## 確認項目
 
 1. **未認証ユーザーのリダイレクト**
