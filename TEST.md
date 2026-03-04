@@ -39,6 +39,13 @@ cp objs/ngx_http_oidc_module.so /app/
    - コールバックエンドポイントで受け取った `code` を用い、NGINXが `/_oidc_token`（トークンエンドポイント用内部ロケーション）へサブリクエストを行うこと。
    - NGINXのデバッグログに `OIDC: Successfully retrieved tokens` が出力されること（トークン取得のJSONパース成功）。
 
+4. **Phase 4 JWT署名検証・セッション発行（追加確認事項）**
+   - サンドボックス環境では外部のIdPとの疎通が制限されているため、以下の動作確認はE2Eテスト環境（またはモックIdPを使用する環境）で人間による確認が必要です。
+   - `/_oidc_jwks` へサブリクエストが発行され、メタデータから取得した `jwks_uri` 経由で公開鍵が正しく取得されること。
+   - `id_token` の署名が `libjwt` を通じて正常に検証され、有効期限（`exp`）や `nonce`（Cookie に保持された値）が一致すること。
+   - 認証成功後、`Set-Cookie` ヘッダにて `oidc_auth=` から始まるHMAC署名付きのセッションCookieが発行されること。
+   - クレーム変数（`$oidc_claim_sub`, `$oidc_claim_email`, `$oidc_claim_name`）が正しくエクスポートされ、バックエンドへのリクエスト時にヘッダ等として利用できること。
+
 ## テスト時のNGINX設定例
 
 ```nginx
@@ -65,6 +72,13 @@ http {
             proxy_set_header Content-Type "application/x-www-form-urlencoded";
             proxy_set_body $args;
             proxy_method POST;
+        }
+
+        # JWKS取得用内部ロケーション
+        location = /_oidc_jwks {
+            internal;
+            proxy_pass http://127.0.0.1:8080/mock_idp/certs;
+            proxy_method GET;
         }
 
         # 略
