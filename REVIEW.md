@@ -429,8 +429,81 @@ if (CRYPTO_memcmp(auth_cookie.data, expected_mac_hex, 64) == 0) {
 
 ---
 
+## 対応優先度
+
+既存バグの修正・未実装機能の追加について、セキュリティ影響度・実用デプロイでの必要性・実装コストを軸に優先度を設定します。
+
+### P0 — セキュリティ上必須（今すぐ対応）
+
+| 項目 | 説明 |
+|------|------|
+| **PKCE 実装** | OAuth 2.1 で必須。Authorization Code Interception 攻撃への対策。現代の IdP（Keycloak, Auth0 等）は PKCE を要求するケースが増加中 |
+| **HMAC シークレットのマルチプロセス問題修正**（改善点 1・2） | マルチワーカー構成で認証が断続的に失敗する致命的バグ。本番では即時修正必須 |
+| **CRYPTO_memcmp() によるタイミング攻撃対策**（改善点 10） | HMAC 比較を定時間比較に変更。セキュリティ要件として分類 |
+| **Cookie に `Secure` / `SameSite=Lax` 追加**（改善点 8・9） | HTTPS 本番環境での必須属性 |
+
+### P1 — 実用デプロイに不可欠
+
+| 項目 | 説明 |
+|------|------|
+| **スコープ設定ディレクティブ (`oidc_scope`)** | `email`, `profile` など `openid` 以外のスコープはほぼ全ての実運用で必要 |
+| **任意クレームの変数展開 (`$oidc_claim_<name>`)** | `groups`, `roles`, `tenant_id` など IdP ごとに異なるクレームへの対応 |
+| **`$oidc_access_token` 変数** | `proxy_set_header Authorization "Bearer $oidc_access_token"` は最も一般的なユースケース |
+| **セッション Cookie に email / name を含める修正**（改善点 3） | 継続リクエストで `$oidc_claim_email` 等が空になる現行バグの修正 |
+| **認証後のリダイレクト先を元 URL に復元**（改善点 4） | 元リクエスト URI を `state` または専用 Cookie に保存し認証後に復元 |
+
+### P2 — 機能完全性・運用品質
+
+| 項目 | 説明 |
+|------|------|
+| **UserInfo エンドポイント対応** | Google, Microsoft 等は ID トークンのクレームを最小限にし UserInfo からの取得を前提とする |
+| **RP-Initiated Logout** | シングルサインアウトの実現に必要。本番アプリではほぼ必須 |
+| **SSL/TLS 設定 (`oidc_ssl_trusted_certificate`)** | 自己署名証明書・内部 CA 環境での信頼性確保 |
+| **ディスカバリキャッシュ有効期限の実装**（改善点 6） | JWK 鍵ローテーション対応。`discovery_expires` フィールドは定義済みで未使用 |
+| **Cookie パース処理の共通化**（改善点 5） | 3 箇所に重複するコードをヘルパー関数に集約 |
+
+### P3 — 拡張・互換性
+
+| 項目 | 説明 |
+|------|------|
+| **`$oidc_id_token` 変数** | ID トークンをそのままバックエンドに渡すユースケース向け |
+| **`oidc_provider` ブロック構文** | 公式 NGINX Plus モジュールとの設定互換性 |
+| **`extra_auth_args` ディレクティブ** | `login_hint`, `prompt=select_account` など特定ユースケース向け追加パラメータ |
+| **`client_secret_post` 認証方式** | `client_secret_basic` を受け付けない IdP への対応 |
+| **SSRF 対策強化**（改善点 7） | `proxy_pass $arg_url` を専用 NGINX 変数に限定し URL 注入リスクを低減 |
+
+### P4 — 将来対応
+
+| 項目 | 説明 |
+|------|------|
+| **Front-Channel Logout** | エンタープライズ向け。ユースケースが限定的 |
+| **サーバーサイドセッション (keyval DB / Redis)** | スケールアウト時に有効。現状の HMAC Cookie でも動作は可能 |
+| **Token Introspection** | IdP への失効確認。リアルタイム性が必要な場合に検討 |
+| **複数プロバイダ対応** | ロケーションごとに異なる IdP を設定 |
+| **自動テストスイート** | 統合テストの自動化 |
+
+### 推奨実装順序
+
+```
+P0: PKCE + HMACマルチプロセス修正 + Cookie Secure/SameSite
+  ↓
+P1: スコープ設定 → 任意クレーム変数 → $oidc_access_token → Cookie修正 → リダイレクト修正
+  ↓
+P2: UserInfo → RP-Initiated Logout → SSL設定 → キャッシュ有効期限 → コード整理
+  ↓
+P3: $oidc_id_token → oidc_providerブロック → extra_auth_args → client_secret_post → SSRF強化
+  ↓
+P4: Front-Channel Logout → keyval DB → Token Introspection → 複数プロバイダ → テスト自動化
+```
+
+P0+P1 を揃えることで、実際の IdP との接続に使える最低限の実用レベルに到達します。
+
+---
+
 ## まとめ
 
 Authorization Code Flow の基本的な実装は完成しており、非同期サブリクエストを使った NGINX らしいノンブロッキングアーキテクチャも適切に実装されています。Phase 4 の JWT 署名検証・nonce 検証・HMAC セッション Cookie も動作しています。
 
 ただし **HMAC シークレットのマルチプロセス問題**（改善点 1・2）は本番環境では致命的なバグであり、マルチワーカー構成では常に認証が不安定になります。また認証後のリダイレクト先の固定（改善点 4）、セッション Cookie の情報不足（改善点 3）、タイミング攻撃への対策（改善点 10）も実用化に向けて早急に対応すべき課題です。
+
+優先度の観点からは、**P0 のセキュリティ修正を最初に完了させ**、次に **P1 の実用機能を揃える**ことで、本番環境への投入が現実的になります。
