@@ -891,6 +891,53 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
                 return NGX_DECLINED;
             }
 
+            /* Validate state parameter against oidc_state cookie to prevent CSRF */
+            ngx_str_t state_param = ngx_null_string;
+            ngx_str_t state_cookie = ngx_null_string;
+
+            ngx_http_arg(r, (u_char *) "state", 5, &state_param);
+
+            {
+                ngx_uint_t j;
+                ngx_list_part_t *spart = &r->headers_in.headers.part;
+                ngx_table_elt_t *sheader = spart->elts;
+                for (j = 0; /* void */ ; j++) {
+                    if (j >= spart->nelts) {
+                        if (spart->next == NULL) break;
+                        spart = spart->next;
+                        sheader = spart->elts;
+                        j = 0;
+                    }
+                    if (sheader[j].key.len == sizeof("Cookie") - 1 &&
+                        ngx_strncasecmp(sheader[j].key.data, (u_char *) "Cookie", sheader[j].key.len) == 0) {
+                        u_char *sp = sheader[j].value.data;
+                        u_char *send = sp + sheader[j].value.len;
+                        while (sp < send) {
+                            if (send - sp >= 11 && ngx_strncmp(sp, "oidc_state=", 11) == 0) {
+                                sp += 11;
+                                state_cookie.data = sp;
+                                while (sp < send && *sp != ';') sp++;
+                                state_cookie.len = sp - state_cookie.data;
+                                break;
+                            }
+                            while (sp < send && *sp != ';') sp++;
+                            if (sp < send) sp++;
+                            while (sp < send && *sp == ' ') sp++;
+                        }
+                        if (state_cookie.data) break;
+                    }
+                }
+            }
+
+            if (state_param.len == 0 || state_cookie.len == 0
+                || state_param.len != state_cookie.len
+                || ngx_strncmp(state_param.data, state_cookie.data, state_param.len) != 0)
+            {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "OIDC: State parameter mismatch or missing (CSRF check failed)");
+                return NGX_HTTP_FORBIDDEN;
+            }
+
             ngx_str_t code_key = ngx_string("code");
             ngx_str_t code_value;
 
