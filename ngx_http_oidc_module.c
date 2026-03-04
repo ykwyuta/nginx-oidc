@@ -4,6 +4,7 @@
 #include <jansson.h>
 #include <openssl/rand.h>
 #include <openssl/hmac.h>
+#include <openssl/crypto.h>
 #include <jwt.h>
 
 /*
@@ -32,6 +33,7 @@ typedef struct {
     time_t discovery_expires;
     u_char hmac_secret[32];
     ngx_uint_t secret_initialized:1;
+    ngx_str_t cookie_secret;  /* configured shared secret for oidc_auth cookie HMAC */
 } ngx_http_oidc_main_conf_t;
 
 /*
@@ -61,6 +63,72 @@ extern ngx_module_t ngx_http_oidc_module;
 
 /* Forward declaration for JSON Parser */
 static ngx_int_t ngx_http_oidc_parse_discovery_json(ngx_http_request_t *r, const u_char *data, size_t len, ngx_http_oidc_provider_metadata_t *metadata);
+
+/*
+ * Cookie helper: search for a named cookie in request headers.
+ * Returns NGX_OK and sets *value on success, NGX_DECLINED if not found.
+ */
+static ngx_int_t
+ngx_http_oidc_get_cookie(ngx_http_request_t *r, const char *name,
+    size_t name_len, ngx_str_t *value)
+{
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *header;
+    u_char            prefix[64];
+    size_t            prefix_len;
+
+    prefix_len = name_len + 1; /* name + '=' */
+    if (prefix_len > sizeof(prefix)) {
+        return NGX_DECLINED;
+    }
+
+    ngx_memcpy(prefix, name, name_len);
+    prefix[name_len] = '=';
+
+    part = &r->headers_in.headers.part;
+    header = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            header = part->elts;
+            i = 0;
+        }
+
+        if (header[i].key.len != sizeof("Cookie") - 1 ||
+            ngx_strncasecmp(header[i].key.data, (u_char *) "Cookie",
+                            header[i].key.len) != 0)
+        {
+            continue;
+        }
+
+        u_char *p   = header[i].value.data;
+        u_char *end = p + header[i].value.len;
+
+        while (p < end) {
+            if ((size_t)(end - p) >= prefix_len &&
+                ngx_strncmp(p, prefix, prefix_len) == 0)
+            {
+                p += prefix_len;
+                value->data = p;
+                while (p < end && *p != ';') {
+                    p++;
+                }
+                value->len = p - value->data;
+                return NGX_OK;
+            }
+            while (p < end && *p != ';') p++;
+            if (p < end) p++;
+            while (p < end && *p == ' ') p++;
+        }
+    }
+
+    return NGX_DECLINED;
+}
 
 /*
  * Subrequest completion handler for OIDC discovery
@@ -108,6 +176,7 @@ static ngx_int_t ngx_http_oidc_discovery_handler(ngx_http_request_t *r, void *da
         if (mcf && mcf->metadata) {
             if (ngx_http_oidc_parse_discovery_json(r->parent, json_data, json_len, mcf->metadata) == NGX_OK) {
                 ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "OIDC: Discovery successful");
+                mcf->discovery_expires = ngx_time() + 3600;
                 ctx->metadata = mcf->metadata;
             } else {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Failed to parse discovery json");
@@ -296,6 +365,21 @@ static ngx_command_t ngx_http_oidc_commands[] = {
       offsetof(ngx_http_oidc_loc_conf_t, redirect_uri),
       NULL },
 
+    /*
+     * oidc_cookie_secret <secret>
+     *
+     * Sets a fixed HMAC secret shared across all worker processes.
+     * Without this directive each worker generates its own random secret,
+     * causing oidc_auth cookies issued by one worker to fail verification
+     * on another worker.  Set this to a long, random string in production.
+     */
+    { ngx_string("oidc_cookie_secret"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_oidc_main_conf_t, cookie_secret),
+      NULL },
+
     ngx_null_command
 };
 
@@ -473,36 +557,8 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
 
                 /* Now verify the nonce */
                 ngx_str_t nonce_cookie = ngx_null_string;
-                ngx_uint_t i;
-                ngx_list_part_t *part = &r->parent->headers_in.headers.part;
-                ngx_table_elt_t *header = part->elts;
-
-                for (i = 0; /* void */ ; i++) {
-                    if (i >= part->nelts) {
-                        if (part->next == NULL) break;
-                        part = part->next;
-                        header = part->elts;
-                        i = 0;
-                    }
-                    if (header[i].key.len == sizeof("Cookie") - 1 &&
-                        ngx_strncasecmp(header[i].key.data, (u_char *) "Cookie", header[i].key.len) == 0) {
-                        u_char *p = header[i].value.data;
-                        u_char *end = p + header[i].value.len;
-                        while (p < end) {
-                            if (end - p >= 11 && ngx_strncmp(p, "oidc_nonce=", 11) == 0) {
-                                p += 11;
-                                nonce_cookie.data = p;
-                                while (p < end && *p != ';') p++;
-                                nonce_cookie.len = p - nonce_cookie.data;
-                                break;
-                            }
-                            while (p < end && *p != ';') p++;
-                            if (p < end) p++;
-                            while (p < end && *p == ' ') p++;
-                        }
-                        if (nonce_cookie.data) break;
-                    }
-                }
+                ngx_http_oidc_get_cookie(r->parent, "oidc_nonce",
+                                         sizeof("oidc_nonce") - 1, &nonce_cookie);
 
                 const char *jwt_nonce = jwt_get_grant(jwt, "nonce");
                 if (nonce_cookie.data && jwt_nonce &&
@@ -535,22 +591,27 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
 
                     /* Issue HMAC signed session cookie */
                     ngx_http_oidc_main_conf_t *mcf = ngx_http_get_module_main_conf(r->parent, ngx_http_oidc_module);
-                    if (mcf) {
-                        if (!mcf->secret_initialized) {
-                            if (RAND_bytes(mcf->hmac_secret, sizeof(mcf->hmac_secret)) == 1) {
-                                mcf->secret_initialized = 1;
-                            }
-                        }
+                    if (mcf && mcf->secret_initialized) {
+                        ngx_table_elt_t *set_cookie_auth;
+                        u_char *p;
 
-                        if (mcf->secret_initialized) {
-                            ngx_table_elt_t *set_cookie_auth;
-                            u_char *p;
-
-                            /* Generate a session identifier (e.g., username or sub + timestamp) */
-                            ngx_str_t payload;
-                            payload.len = ctx->claims.sub.len + 32;
-                            payload.data = ngx_palloc(r->parent->pool, payload.len);
-                            payload.len = ngx_snprintf(payload.data, payload.len, "%V:%T", &ctx->claims.sub, ngx_time()) - payload.data;
+                        /*
+                         * Payload format: sub:email:name:timestamp
+                         * Allows restoring all three claims on subsequent requests.
+                         */
+                        ngx_str_t payload;
+                        payload.len = ctx->claims.sub.len + 1
+                                    + ctx->claims.email.len + 1
+                                    + ctx->claims.name.len + 1
+                                    + 20 + 1; /* timestamp + NUL */
+                        payload.data = ngx_palloc(r->parent->pool, payload.len);
+                        if (payload.data) {
+                            payload.len = ngx_snprintf(payload.data, payload.len,
+                                                       "%V:%V:%V:%T",
+                                                       &ctx->claims.sub,
+                                                       &ctx->claims.email,
+                                                       &ctx->claims.name,
+                                                       ngx_time()) - payload.data;
 
                             u_char mac[32];
                             u_char mac_hex[64];
@@ -565,45 +626,72 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
                             if (set_cookie_auth) {
                                 set_cookie_auth->hash = 1;
                                 ngx_str_set(&set_cookie_auth->key, "Set-Cookie");
-                                set_cookie_auth->value.len = sizeof("oidc_auth=") - 1 + 64 + payload.len + sizeof("; HttpOnly; Path=/") - 1;
-                                set_cookie_auth->value.data = ngx_pnalloc(r->parent->pool, set_cookie_auth->value.len);
+                                set_cookie_auth->value.len =
+                                    sizeof("oidc_auth=") - 1 + 64 + payload.len
+                                    + sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1;
+                                set_cookie_auth->value.data = ngx_pnalloc(r->parent->pool,
+                                                                          set_cookie_auth->value.len);
                                 if (set_cookie_auth->value.data) {
                                     p = set_cookie_auth->value.data;
                                     p = ngx_cpymem(p, "oidc_auth=", sizeof("oidc_auth=") - 1);
                                     p = ngx_cpymem(p, mac_hex, 64);
                                     p = ngx_cpymem(p, payload.data, payload.len);
-                                    p = ngx_cpymem(p, "; HttpOnly; Path=/", sizeof("; HttpOnly; Path=/") - 1);
+                                    p = ngx_cpymem(p, "; HttpOnly; Secure; SameSite=Lax; Path=/",
+                                                   sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1);
                                 }
                             }
                         }
                     }
 
-                    /* Clear state and nonce cookies */
+                    /* Clear state, nonce, and return_to cookies */
                     ngx_table_elt_t *clear_state;
                     ngx_table_elt_t *clear_nonce;
+                    ngx_table_elt_t *clear_return_to;
 
                     clear_state = ngx_list_push(&r->parent->headers_out.headers);
                     if (clear_state) {
                         clear_state->hash = 1;
                         ngx_str_set(&clear_state->key, "Set-Cookie");
-                        ngx_str_set(&clear_state->value, "oidc_state=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/");
+                        ngx_str_set(&clear_state->value,
+                                    "oidc_state=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
+                                    " Secure; SameSite=Lax; Path=/");
                     }
 
                     clear_nonce = ngx_list_push(&r->parent->headers_out.headers);
                     if (clear_nonce) {
                         clear_nonce->hash = 1;
                         ngx_str_set(&clear_nonce->key, "Set-Cookie");
-                        ngx_str_set(&clear_nonce->value, "oidc_nonce=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/");
+                        ngx_str_set(&clear_nonce->value,
+                                    "oidc_nonce=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
+                                    " Secure; SameSite=Lax; Path=/");
                     }
 
-                    /* Provide redirect to original URL */
+                    clear_return_to = ngx_list_push(&r->parent->headers_out.headers);
+                    if (clear_return_to) {
+                        clear_return_to->hash = 1;
+                        ngx_str_set(&clear_return_to->key, "Set-Cookie");
+                        ngx_str_set(&clear_return_to->value,
+                                    "oidc_return_to=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
+                                    " Secure; SameSite=Lax; Path=/");
+                    }
+
+                    /* Redirect to original request URI saved in oidc_return_to cookie */
                     ngx_table_elt_t *location;
                     location = ngx_list_push(&r->parent->headers_out.headers);
                     if (location) {
                         location->hash = 1;
                         ngx_str_set(&location->key, "Location");
-                        /* Use redirect_uri path for now or original request URI */
-                        ngx_str_set(&location->value, "/");
+
+                        ngx_str_t return_to = ngx_null_string;
+                        ngx_http_oidc_get_cookie(r->parent, "oidc_return_to",
+                                                 sizeof("oidc_return_to") - 1, &return_to);
+                        /* Validate: must start with '/' to prevent open redirect */
+                        if (return_to.len > 0 && return_to.data[0] == '/') {
+                            location->value = return_to;
+                        } else {
+                            ngx_str_set(&location->value, "/");
+                        }
+
                         r->parent->headers_out.status = NGX_HTTP_MOVED_TEMPORARILY;
                         r->parent->headers_out.location = location;
                     }
@@ -798,13 +886,15 @@ static ngx_int_t ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r, ngx_http_o
     }
     set_cookie_state->hash = 1;
     ngx_str_set(&set_cookie_state->key, "Set-Cookie");
-    set_cookie_state->value.len = sizeof("oidc_state=") - 1 + state.len + sizeof("; HttpOnly") - 1;
+    set_cookie_state->value.len = sizeof("oidc_state=") - 1 + state.len
+                                + sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1;
     set_cookie_state->value.data = ngx_pnalloc(r->pool, set_cookie_state->value.len);
     if (set_cookie_state->value.data) {
         p = set_cookie_state->value.data;
         p = ngx_cpymem(p, "oidc_state=", sizeof("oidc_state=") - 1);
         p = ngx_cpymem(p, state.data, state.len);
-        p = ngx_cpymem(p, "; HttpOnly", sizeof("; HttpOnly") - 1);
+        p = ngx_cpymem(p, "; HttpOnly; Secure; SameSite=Lax; Path=/",
+                       sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1);
     }
 
     /* Set Cookie for nonce */
@@ -814,13 +904,37 @@ static ngx_int_t ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r, ngx_http_o
     }
     set_cookie_nonce->hash = 1;
     ngx_str_set(&set_cookie_nonce->key, "Set-Cookie");
-    set_cookie_nonce->value.len = sizeof("oidc_nonce=") - 1 + nonce.len + sizeof("; HttpOnly") - 1;
+    set_cookie_nonce->value.len = sizeof("oidc_nonce=") - 1 + nonce.len
+                                + sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1;
     set_cookie_nonce->value.data = ngx_pnalloc(r->pool, set_cookie_nonce->value.len);
     if (set_cookie_nonce->value.data) {
         p = set_cookie_nonce->value.data;
         p = ngx_cpymem(p, "oidc_nonce=", sizeof("oidc_nonce=") - 1);
         p = ngx_cpymem(p, nonce.data, nonce.len);
-        p = ngx_cpymem(p, "; HttpOnly", sizeof("; HttpOnly") - 1);
+        p = ngx_cpymem(p, "; HttpOnly; Secure; SameSite=Lax; Path=/",
+                       sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1);
+    }
+
+    /*
+     * Save original request URI so we can redirect there after authentication.
+     * Limit to 2048 bytes to stay within cookie size limits.
+     */
+    ngx_table_elt_t *set_cookie_return_to;
+    set_cookie_return_to = ngx_list_push(&r->headers_out.headers);
+    if (set_cookie_return_to != NULL) {
+        size_t uri_len = r->uri.len > 2048 ? 2048 : r->uri.len;
+        set_cookie_return_to->hash = 1;
+        ngx_str_set(&set_cookie_return_to->key, "Set-Cookie");
+        set_cookie_return_to->value.len = sizeof("oidc_return_to=") - 1 + uri_len
+                                        + sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1;
+        set_cookie_return_to->value.data = ngx_pnalloc(r->pool, set_cookie_return_to->value.len);
+        if (set_cookie_return_to->value.data) {
+            p = set_cookie_return_to->value.data;
+            p = ngx_cpymem(p, "oidc_return_to=", sizeof("oidc_return_to=") - 1);
+            p = ngx_cpymem(p, r->uri.data, uri_len);
+            p = ngx_cpymem(p, "; HttpOnly; Secure; SameSite=Lax; Path=/",
+                           sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1);
+        }
     }
 
     return NGX_HTTP_MOVED_TEMPORARILY;
@@ -853,7 +967,15 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
     }
 
     if (mcf && mcf->metadata != NULL) {
-        ctx->metadata = mcf->metadata;
+        /* Invalidate cached metadata if TTL has expired */
+        if (ngx_time() > mcf->discovery_expires) {
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                          "OIDC: Discovery cache expired, re-fetching");
+            mcf->metadata = NULL;
+            mcf->discovery_expires = 0;
+        } else {
+            ctx->metadata = mcf->metadata;
+        }
     }
 
     if (conf->oidc_provider.len > 0 && ctx->metadata == NULL) {
@@ -914,36 +1036,8 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
 
             /* Verify state against oidc_state cookie */
             ngx_str_t state_cookie = ngx_null_string;
-            ngx_uint_t j;
-            ngx_list_part_t *cpart = &r->headers_in.headers.part;
-            ngx_table_elt_t *cheader = cpart->elts;
-
-            for (j = 0; /* void */ ; j++) {
-                if (j >= cpart->nelts) {
-                    if (cpart->next == NULL) break;
-                    cpart = cpart->next;
-                    cheader = cpart->elts;
-                    j = 0;
-                }
-                if (cheader[j].key.len == sizeof("Cookie") - 1 &&
-                    ngx_strncasecmp(cheader[j].key.data, (u_char *) "Cookie", cheader[j].key.len) == 0) {
-                    u_char *p = cheader[j].value.data;
-                    u_char *end = p + cheader[j].value.len;
-                    while (p < end) {
-                        if (end - p >= 11 && ngx_strncmp(p, "oidc_state=", 11) == 0) {
-                            p += 11;
-                            state_cookie.data = p;
-                            while (p < end && *p != ';') p++;
-                            state_cookie.len = p - state_cookie.data;
-                            break;
-                        }
-                        while (p < end && *p != ';') p++;
-                        if (p < end) p++;
-                        while (p < end && *p == ' ') p++;
-                    }
-                    if (state_cookie.data) break;
-                }
-            }
+            ngx_http_oidc_get_cookie(r, "oidc_state", sizeof("oidc_state") - 1,
+                                     &state_cookie);
 
             if (state_cookie.data == NULL || state_value.len != state_cookie.len ||
                 ngx_strncmp(state_value.data, state_cookie.data, state_cookie.len) != 0) {
@@ -955,56 +1049,13 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
         }
 
         /* Check for authentication via HMAC signed session cookie */
-        ngx_uint_t i;
-        ngx_list_part_t *part;
-        ngx_table_elt_t *header;
         ngx_uint_t authenticated = 0;
         ngx_str_t auth_cookie = ngx_null_string;
 
-        part = &r->headers_in.headers.part;
-        header = part->elts;
-
-        for (i = 0; /* void */ ; i++) {
-            if (i >= part->nelts) {
-                if (part->next == NULL) {
-                    break;
-                }
-                part = part->next;
-                header = part->elts;
-                i = 0;
-            }
-            if (header[i].key.len == sizeof("Cookie") - 1 &&
-                ngx_strncasecmp(header[i].key.data, (u_char *) "Cookie", header[i].key.len) == 0) {
-
-                u_char *p = header[i].value.data;
-                u_char *end = p + header[i].value.len;
-                while (p < end) {
-                    if (end - p >= 10 && ngx_strncmp(p, "oidc_auth=", 10) == 0) {
-                        p += 10;
-                        auth_cookie.data = p;
-                        while (p < end && *p != ';') {
-                            p++;
-                        }
-                        auth_cookie.len = p - auth_cookie.data;
-                        break;
-                    }
-                    while (p < end && *p != ';') p++;
-                    if (p < end) p++;
-                    while (p < end && *p == ' ') p++;
-                }
-                if (auth_cookie.data) {
-                    break;
-                }
-            }
-        }
+        ngx_http_oidc_get_cookie(r, "oidc_auth", sizeof("oidc_auth") - 1, &auth_cookie);
 
         if (auth_cookie.data && auth_cookie.len > 64) {
-            /* Verify HMAC: The cookie format is HMAC_HEX(64 bytes) + PAYLOAD */
-            if (mcf && !mcf->secret_initialized) {
-                if (RAND_bytes(mcf->hmac_secret, sizeof(mcf->hmac_secret)) == 1) {
-                    mcf->secret_initialized = 1;
-                }
-            }
+            /* Verify HMAC: cookie format is HMAC_HEX(64 chars) + PAYLOAD */
             if (mcf && mcf->secret_initialized) {
                 u_char expected_mac[32];
                 u_char expected_mac_hex[64];
@@ -1016,16 +1067,40 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
 
                 ngx_hex_dump(expected_mac_hex, expected_mac, 32);
 
-                if (ngx_strncmp(auth_cookie.data, expected_mac_hex, 64) == 0) {
+                /* Use constant-time comparison to prevent timing attacks */
+                if (CRYPTO_memcmp(auth_cookie.data, expected_mac_hex, 64) == 0) {
                     authenticated = 1;
-                    /* Extract sub claim from payload for variable access */
-                    u_char *payload = auth_cookie.data + 64;
-                    u_char *colon = (u_char *)ngx_strchr(payload, ':');
-                    if (colon) {
-                        ctx->claims.sub.len = colon - payload;
+
+                    /*
+                     * Extract claims from payload: sub:email:name:timestamp
+                     * Restore all three claims for variable access in this request.
+                     */
+                    u_char *pl    = auth_cookie.data + 64;
+                    u_char *pl_end = auth_cookie.data + auth_cookie.len;
+                    u_char *c1 = ngx_strlchr(pl, pl_end, ':');
+                    if (c1) {
+                        ctx->claims.sub.len  = c1 - pl;
                         ctx->claims.sub.data = ngx_palloc(r->pool, ctx->claims.sub.len);
                         if (ctx->claims.sub.data) {
-                            ngx_memcpy(ctx->claims.sub.data, payload, ctx->claims.sub.len);
+                            ngx_memcpy(ctx->claims.sub.data, pl, ctx->claims.sub.len);
+                        }
+
+                        u_char *c2 = ngx_strlchr(c1 + 1, pl_end, ':');
+                        if (c2) {
+                            ctx->claims.email.len  = c2 - (c1 + 1);
+                            ctx->claims.email.data = ngx_palloc(r->pool, ctx->claims.email.len);
+                            if (ctx->claims.email.data) {
+                                ngx_memcpy(ctx->claims.email.data, c1 + 1, ctx->claims.email.len);
+                            }
+
+                            u_char *c3 = ngx_strlchr(c2 + 1, pl_end, ':');
+                            if (c3) {
+                                ctx->claims.name.len  = c3 - (c2 + 1);
+                                ctx->claims.name.data = ngx_palloc(r->pool, ctx->claims.name.len);
+                                if (ctx->claims.name.data) {
+                                    ngx_memcpy(ctx->claims.name.data, c2 + 1, ctx->claims.name.len);
+                                }
+                            }
                         }
                     }
                 }
@@ -1081,6 +1156,49 @@ static ngx_int_t ngx_http_oidc_name_variable(ngx_http_request_t *r, ngx_http_var
     } else {
         v->not_found = 1;
     }
+    return NGX_OK;
+}
+
+/*
+ * init_process: initialise the HMAC secret once per worker process.
+ *
+ * If oidc_cookie_secret is configured the same value is used in every
+ * worker, so cookies remain valid regardless of which worker serves the
+ * request.  Without it each worker falls back to a random secret (cookies
+ * issued by worker A will not verify on worker B).
+ */
+static ngx_int_t
+ngx_http_oidc_init_process(ngx_cycle_t *cycle)
+{
+    ngx_http_oidc_main_conf_t *mcf;
+
+    mcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_oidc_module);
+    if (mcf == NULL) {
+        return NGX_OK;
+    }
+
+    if (mcf->cookie_secret.len > 0) {
+        /* Use configured shared secret */
+        size_t secret_len = mcf->cookie_secret.len < sizeof(mcf->hmac_secret)
+                            ? mcf->cookie_secret.len
+                            : sizeof(mcf->hmac_secret);
+        ngx_memzero(mcf->hmac_secret, sizeof(mcf->hmac_secret));
+        ngx_memcpy(mcf->hmac_secret, mcf->cookie_secret.data, secret_len);
+        mcf->secret_initialized = 1;
+    } else {
+        /* Fallback: per-worker random secret (sessions not portable across workers) */
+        ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                      "oidc: oidc_cookie_secret not set; "
+                      "each worker uses a random HMAC secret. "
+                      "Set oidc_cookie_secret for multi-worker deployments.");
+        if (RAND_bytes(mcf->hmac_secret, sizeof(mcf->hmac_secret)) != 1) {
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                          "oidc: RAND_bytes() failed for HMAC secret");
+            return NGX_ERROR;
+        }
+        mcf->secret_initialized = 1;
+    }
+
     return NGX_OK;
 }
 
@@ -1158,7 +1276,7 @@ ngx_module_t ngx_http_oidc_module = {
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
     NULL,                                  /* init module */
-    NULL,                                  /* init process */
+    ngx_http_oidc_init_process,            /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
     NULL,                                  /* exit process */
