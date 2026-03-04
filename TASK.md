@@ -7,8 +7,11 @@
   - [x] Janssonを用いたJSONレスポンスのパース関数（`ngx_http_oidc_parse_discovery_json`）の実装
   - [x] NGINXサブリクエストを用いた `.well-known/openid-configuration` の非同期取得（`ngx_http_oidc_start_discovery`, `ngx_http_oidc_discovery_handler`）の実装
   - [x] OIDCエンドポイント情報の内部構造体への保存
-- [ ] **Phase 3: 認証フローの実装**
-  リダイレクト処理、コールバックエンドポイントの処理、トークンの取得（サブリクエスト使用）。
+- [x] **Phase 3: 認証フローの実装**
+  - [x] 未認証アクセス時のIdP認可エンドポイントへのリダイレクト処理（`ngx_http_oidc_redirect_to_idp`）の実装
+  - [x] コールバックURIからの `code` パラメータの抽出とハンドリングの実装
+  - [x] NGINXサブリクエストを用いたトークンエンドポイントからのトークン取得（`ngx_http_oidc_start_token_request`, `ngx_http_oidc_token_handler`）の実装
+  - [x] 設定ディレクティブ（`oidc_client_id`, `oidc_client_secret`, `oidc_redirect_uri`）の追加
 - [ ] **Phase 4: JWT検証と変数公開**
   取得したJWTの署名検証と、NGINX内部変数（`$oidc_claim_*`）へのデータエクスポート機能の実装。セッション管理。
 - [ ] **Phase 5: テストと最適化**
