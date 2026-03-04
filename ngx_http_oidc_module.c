@@ -77,12 +77,13 @@ static ngx_int_t ngx_http_oidc_discovery_handler(ngx_http_request_t *r, void *da
 
     if (rc == NGX_ERROR || r->headers_out.status != NGX_HTTP_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Discovery request failed, status: %ui", r->headers_out.status);
-        ctx->discovery_attempted = 0; /* Allow retry */
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
         return NGX_ERROR;
     }
 
     if (r->upstream == NULL || r->upstream->buffer.start == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Discovery request returned no upstream buffer");
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
         return NGX_ERROR;
     }
 
@@ -109,11 +110,16 @@ static ngx_int_t ngx_http_oidc_discovery_handler(ngx_http_request_t *r, void *da
                 ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "OIDC: Discovery successful");
                 ctx->metadata = mcf->metadata;
             } else {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Failed to parse discovery json");
                 mcf->metadata = NULL;
-                ctx->discovery_attempted = 0; /* Allow retry */
+                if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
                 return NGX_ERROR;
             }
         }
+    } else {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Discovery request returned no data");
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
+        return NGX_ERROR;
     }
 
     /* Resume the main request */
@@ -893,13 +899,59 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
 
             ngx_str_t code_key = ngx_string("code");
             ngx_str_t code_value;
+            ngx_str_t state_key = ngx_string("state");
+            ngx_str_t state_value;
 
-            if (ngx_http_arg(r, code_key.data, code_key.len, &code_value) == NGX_OK) {
-                return ngx_http_oidc_start_token_request(r, conf, &code_value);
-            } else {
+            if (ngx_http_arg(r, code_key.data, code_key.len, &code_value) != NGX_OK) {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Missing code parameter in callback");
                 return NGX_HTTP_BAD_REQUEST;
             }
+
+            if (ngx_http_arg(r, state_key.data, state_key.len, &state_value) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Missing state parameter in callback");
+                return NGX_HTTP_BAD_REQUEST;
+            }
+
+            /* Verify state against oidc_state cookie */
+            ngx_str_t state_cookie = ngx_null_string;
+            ngx_uint_t j;
+            ngx_list_part_t *cpart = &r->headers_in.headers.part;
+            ngx_table_elt_t *cheader = cpart->elts;
+
+            for (j = 0; /* void */ ; j++) {
+                if (j >= cpart->nelts) {
+                    if (cpart->next == NULL) break;
+                    cpart = cpart->next;
+                    cheader = cpart->elts;
+                    j = 0;
+                }
+                if (cheader[j].key.len == sizeof("Cookie") - 1 &&
+                    ngx_strncasecmp(cheader[j].key.data, (u_char *) "Cookie", cheader[j].key.len) == 0) {
+                    u_char *p = cheader[j].value.data;
+                    u_char *end = p + cheader[j].value.len;
+                    while (p < end) {
+                        if (end - p >= 11 && ngx_strncmp(p, "oidc_state=", 11) == 0) {
+                            p += 11;
+                            state_cookie.data = p;
+                            while (p < end && *p != ';') p++;
+                            state_cookie.len = p - state_cookie.data;
+                            break;
+                        }
+                        while (p < end && *p != ';') p++;
+                        if (p < end) p++;
+                        while (p < end && *p == ' ') p++;
+                    }
+                    if (state_cookie.data) break;
+                }
+            }
+
+            if (state_cookie.data == NULL || state_value.len != state_cookie.len ||
+                ngx_strncmp(state_value.data, state_cookie.data, state_cookie.len) != 0) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: State mismatch or missing in callback");
+                return NGX_HTTP_FORBIDDEN;
+            }
+
+            return ngx_http_oidc_start_token_request(r, conf, &code_value);
         }
 
         /* Check for authentication via HMAC signed session cookie */
