@@ -77,12 +77,15 @@ static ngx_int_t ngx_http_oidc_discovery_handler(ngx_http_request_t *r, void *da
 
     if (rc == NGX_ERROR || r->headers_out.status != NGX_HTTP_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Discovery request failed, status: %ui", r->headers_out.status);
-        ctx->discovery_attempted = 0; /* Allow retry */
+        if (mcf) mcf->discovery_expires = ngx_time() + 60;
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
         return NGX_ERROR;
     }
 
     if (r->upstream == NULL || r->upstream->buffer.start == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Discovery request returned no upstream buffer");
+        if (mcf) mcf->discovery_expires = ngx_time() + 60;
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
         return NGX_ERROR;
     }
 
@@ -110,10 +113,16 @@ static ngx_int_t ngx_http_oidc_discovery_handler(ngx_http_request_t *r, void *da
                 ctx->metadata = mcf->metadata;
             } else {
                 mcf->metadata = NULL;
-                ctx->discovery_attempted = 0; /* Allow retry */
+                mcf->discovery_expires = ngx_time() + 60;
+                if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
                 return NGX_ERROR;
             }
         }
+    } else {
+        /* No json_data extracted from the buffer */
+        if (mcf) mcf->discovery_expires = ngx_time() + 60;
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
+        return NGX_ERROR;
     }
 
     /* Resume the main request */
@@ -309,11 +318,13 @@ static ngx_int_t ngx_http_oidc_token_handler(ngx_http_request_t *r, void *data, 
 
     if (rc == NGX_ERROR || r->headers_out.status != NGX_HTTP_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Token request failed, status: %ui", r->headers_out.status);
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
         return NGX_ERROR;
     }
 
     if (r->upstream == NULL || r->upstream->buffer.start == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Token request returned no upstream buffer");
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
         return NGX_ERROR;
     }
 
@@ -371,7 +382,7 @@ static ngx_int_t ngx_http_oidc_token_handler(ngx_http_request_t *r, void *data, 
         r->parent->write_event_handler = ngx_http_core_run_phases;
     }
 
-    return NGX_OK;
+    return NGX_ERROR;
 }
 
 static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, ngx_int_t rc);
@@ -854,6 +865,11 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
         if (ctx->discovery_attempted) {
             /* Discovery failed for this request context. Do not retry in the *same* request */
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Discovery failed previously in this request");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        if (mcf && mcf->discovery_expires > ngx_time()) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Discovery failed recently, backing off");
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
