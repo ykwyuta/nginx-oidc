@@ -33,7 +33,8 @@ cp objs/ngx_http_oidc_module.so /app/
      - `nonce`
 
 2. **コールバックエンドポイントの処理**
-   - IdPからリダイレクトされてくるコールバックURI（例: `/callback?code=xxx`）にアクセスした際、内部で正しくインターセプトされること。
+   - IdPからリダイレクトされてくるコールバックURI（例: `/callback?code=xxx&state=yyy`）にアクセスした際、内部で正しくインターセプトされること。
+   - `code` や `state` が欠落している場合や、`state` が `oidc_state` Cookie の値と一致しない場合は `400 Bad Request` または `403 Forbidden` となること。
 
 3. **トークン取得サブリクエストの実行**
    - コールバックエンドポイントで受け取った `code` を用い、NGINXが `/_oidc_token`（トークンエンドポイント用内部ロケーション）へサブリクエストを行うこと。
