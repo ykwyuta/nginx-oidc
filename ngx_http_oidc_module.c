@@ -5,6 +5,7 @@
 #include <openssl/rand.h>
 #include <openssl/hmac.h>
 #include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include <jwt.h>
 
 /*
@@ -56,6 +57,7 @@ typedef struct {
     ngx_uint_t token_attempted:1;
     ngx_str_t id_token;
     ngx_http_oidc_claims_t claims;
+    ngx_str_t redirect_after_auth;  /* redirect target after successful auth */
 } ngx_http_oidc_ctx_t;
 
 /* Forward declaration for ngx_http_oidc_module */
@@ -63,6 +65,41 @@ extern ngx_module_t ngx_http_oidc_module;
 
 /* Forward declaration for JSON Parser */
 static ngx_int_t ngx_http_oidc_parse_discovery_json(ngx_http_request_t *r, const u_char *data, size_t len, ngx_http_oidc_provider_metadata_t *metadata);
+
+/*
+ * base64url encode (RFC 4648 §5, no padding).
+ * dst must be at least ngx_http_oidc_base64url_len(len) bytes.
+ * Returns the number of bytes written.
+ */
+static size_t
+ngx_http_oidc_base64url_len(size_t input_len)
+{
+    return (input_len * 4 + 2) / 3;
+}
+
+static void
+ngx_http_oidc_base64url_encode(u_char *dst, const u_char *src, size_t len)
+{
+    static const u_char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t   i;
+    u_char  *p = dst;
+
+    for (i = 0; i + 2 < len; i += 3) {
+        *p++ = tbl[(src[i] >> 2) & 0x3f];
+        *p++ = tbl[((src[i] << 4) | (src[i + 1] >> 4)) & 0x3f];
+        *p++ = tbl[((src[i + 1] << 2) | (src[i + 2] >> 6)) & 0x3f];
+        *p++ = tbl[src[i + 2] & 0x3f];
+    }
+    if (i + 1 == len) {
+        *p++ = tbl[(src[i] >> 2) & 0x3f];
+        *p++ = tbl[(src[i] << 4) & 0x3f];
+    } else if (i + 2 == len) {
+        *p++ = tbl[(src[i] >> 2) & 0x3f];
+        *p++ = tbl[((src[i] << 4) | (src[i + 1] >> 4)) & 0x3f];
+        *p++ = tbl[(src[i + 1] << 2) & 0x3f];
+    }
+}
 
 /*
  * Cookie helper: search for a named cookie in request headers.
@@ -643,10 +680,11 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
                         }
                     }
 
-                    /* Clear state, nonce, and return_to cookies */
+                    /* Clear state, nonce, return_to, and pkce_verifier cookies */
                     ngx_table_elt_t *clear_state;
                     ngx_table_elt_t *clear_nonce;
                     ngx_table_elt_t *clear_return_to;
+                    ngx_table_elt_t *clear_pkce;
 
                     clear_state = ngx_list_push(&r->parent->headers_out.headers);
                     if (clear_state) {
@@ -675,25 +713,30 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
                                     " Secure; SameSite=Lax; Path=/");
                     }
 
-                    /* Redirect to original request URI saved in oidc_return_to cookie */
-                    ngx_table_elt_t *location;
-                    location = ngx_list_push(&r->parent->headers_out.headers);
-                    if (location) {
-                        location->hash = 1;
-                        ngx_str_set(&location->key, "Location");
+                    clear_pkce = ngx_list_push(&r->parent->headers_out.headers);
+                    if (clear_pkce) {
+                        clear_pkce->hash = 1;
+                        ngx_str_set(&clear_pkce->key, "Set-Cookie");
+                        ngx_str_set(&clear_pkce->value,
+                                    "oidc_pkce_verifier=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
+                                    " Secure; SameSite=Lax; Path=/");
+                    }
 
+                    /*
+                     * Store redirect target in ctx so the access handler can issue
+                     * the 302 directly – avoids the content phase (proxy_pass)
+                     * overwriting the status that was set here.
+                     */
+                    {
                         ngx_str_t return_to = ngx_null_string;
                         ngx_http_oidc_get_cookie(r->parent, "oidc_return_to",
                                                  sizeof("oidc_return_to") - 1, &return_to);
                         /* Validate: must start with '/' to prevent open redirect */
                         if (return_to.len > 0 && return_to.data[0] == '/') {
-                            location->value = return_to;
+                            ctx->redirect_after_auth = return_to;
                         } else {
-                            ngx_str_set(&location->value, "/");
+                            ngx_str_set(&ctx->redirect_after_auth, "/");
                         }
-
-                        r->parent->headers_out.status = NGX_HTTP_MOVED_TEMPORARILY;
-                        r->parent->headers_out.location = location;
                     }
 
                 } else {
@@ -725,17 +768,28 @@ static ngx_int_t ngx_http_oidc_start_token_request(ngx_http_request_t *r, ngx_ht
     ngx_str_t token_args;
     u_char *p;
 
+    /* Read PKCE code_verifier from cookie */
+    ngx_str_t pkce_verifier = ngx_null_string;
+    ngx_http_oidc_get_cookie(r, "oidc_pkce_verifier",
+                             sizeof("oidc_pkce_verifier") - 1, &pkce_verifier);
+
     size_t code_enc_len = code->len + 2 * ngx_escape_uri(NULL, code->data, code->len, NGX_ESCAPE_ARGS);
     size_t client_id_enc_len = conf->client_id.len + 2 * ngx_escape_uri(NULL, conf->client_id.data, conf->client_id.len, NGX_ESCAPE_ARGS);
     size_t client_secret_enc_len = conf->client_secret.len + 2 * ngx_escape_uri(NULL, conf->client_secret.data, conf->client_secret.len, NGX_ESCAPE_ARGS);
     size_t redirect_uri_enc_len = conf->redirect_uri.len + 2 * ngx_escape_uri(NULL, conf->redirect_uri.data, conf->redirect_uri.len, NGX_ESCAPE_ARGS);
 
-    /* "code=&client_id=&client_secret=&redirect_uri=&grant_type=authorization_code" */
+    /* "code=&client_id=&client_secret=&redirect_uri=&grant_type=authorization_code"
+     * + optional "&code_verifier=<verifier>"
+     */
     size_t len = sizeof("code=") - 1 + code_enc_len
                + sizeof("&client_id=") - 1 + client_id_enc_len
                + sizeof("&client_secret=") - 1 + client_secret_enc_len
                + sizeof("&redirect_uri=") - 1 + redirect_uri_enc_len
                + sizeof("&grant_type=authorization_code") - 1;
+
+    if (pkce_verifier.len > 0) {
+        len += sizeof("&code_verifier=") - 1 + pkce_verifier.len;
+    }
 
     token_args.data = ngx_palloc(r->pool, len + 1);
     if (token_args.data == NULL) {
@@ -772,6 +826,11 @@ static ngx_int_t ngx_http_oidc_start_token_request(ngx_http_request_t *r, ngx_ht
     }
 
     p = ngx_cpymem(p, "&grant_type=authorization_code", sizeof("&grant_type=authorization_code") - 1);
+
+    if (pkce_verifier.len > 0) {
+        p = ngx_cpymem(p, "&code_verifier=", sizeof("&code_verifier=") - 1);
+        p = ngx_cpymem(p, pkce_verifier.data, pkce_verifier.len);
+    }
 
     token_args.len = p - token_args.data;
 
@@ -813,8 +872,20 @@ static ngx_int_t ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r, ngx_http_o
     ngx_str_t state;
     ngx_str_t nonce;
 
-    if (RAND_bytes(state_buf, 32) != 1 || RAND_bytes(nonce_buf, 32) != 1) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Failed to generate random bytes for state/nonce");
+    /* PKCE: generate code_verifier (32 random bytes → 43-char base64url) */
+    u_char  verifier_raw[32];
+    size_t  verifier_b64_len = ngx_http_oidc_base64url_len(sizeof(verifier_raw));
+    u_char  verifier_b64[44]; /* 43 chars + safety */
+    u_char  challenge_raw[32]; /* SHA-256 digest */
+    size_t  challenge_b64_len = ngx_http_oidc_base64url_len(sizeof(challenge_raw));
+    u_char  challenge_b64[44];
+    unsigned int digest_len = 32;
+
+    if (RAND_bytes(state_buf, 32) != 1 || RAND_bytes(nonce_buf, 32) != 1 ||
+        RAND_bytes(verifier_raw, sizeof(verifier_raw)) != 1)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: Failed to generate random bytes for state/nonce/pkce");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -824,6 +895,21 @@ static ngx_int_t ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r, ngx_http_o
     state.len = 64;
     nonce.data = nonce_hex;
     nonce.len = 64;
+
+    /* code_verifier = base64url(verifier_raw) */
+    ngx_http_oidc_base64url_encode(verifier_b64, verifier_raw, sizeof(verifier_raw));
+    verifier_b64[verifier_b64_len] = '\0';
+
+    /* code_challenge = base64url(SHA256(code_verifier)) */
+    if (EVP_Digest(verifier_b64, verifier_b64_len,
+                   challenge_raw, &digest_len, EVP_sha256(), NULL) != 1)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: EVP_Digest failed for PKCE code_challenge");
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    ngx_http_oidc_base64url_encode(challenge_b64, challenge_raw, sizeof(challenge_raw));
+    challenge_b64[challenge_b64_len] = '\0';
 
     if (auth_endpoint->len == 0 || conf->client_id.len == 0 || conf->redirect_uri.len == 0) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Missing authorization_endpoint, client_id, or redirect_uri");
@@ -836,10 +922,13 @@ static ngx_int_t ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r, ngx_http_o
     /* Calculate URL length:
      * auth_endpoint + "?response_type=code&scope=openid&client_id=" + client_id
      * + "&redirect_uri=" + redirect_uri + "&state=" + state + "&nonce=" + nonce
+     * + "&code_challenge=" + challenge + "&code_challenge_method=S256"
      */
     len = auth_endpoint->len + sizeof("?response_type=code&scope=openid&client_id=") - 1
         + client_id_enc_len + sizeof("&redirect_uri=") - 1 + redirect_uri_enc_len
-        + sizeof("&state=") - 1 + state.len + sizeof("&nonce=") - 1 + nonce.len;
+        + sizeof("&state=") - 1 + state.len + sizeof("&nonce=") - 1 + nonce.len
+        + sizeof("&code_challenge=") - 1 + challenge_b64_len
+        + sizeof("&code_challenge_method=S256") - 1;
 
     location = ngx_list_push(&r->headers_out.headers);
     if (location == NULL) {
@@ -874,6 +963,9 @@ static ngx_int_t ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r, ngx_http_o
     p = ngx_cpymem(p, state.data, state.len);
     p = ngx_cpymem(p, "&nonce=", sizeof("&nonce=") - 1);
     p = ngx_cpymem(p, nonce.data, nonce.len);
+    p = ngx_cpymem(p, "&code_challenge=", sizeof("&code_challenge=") - 1);
+    p = ngx_cpymem(p, challenge_b64, challenge_b64_len);
+    p = ngx_cpymem(p, "&code_challenge_method=S256", sizeof("&code_challenge_method=S256") - 1);
 
     location->value.len = p - location->value.data;
 
@@ -911,6 +1003,25 @@ static ngx_int_t ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r, ngx_http_o
         p = set_cookie_nonce->value.data;
         p = ngx_cpymem(p, "oidc_nonce=", sizeof("oidc_nonce=") - 1);
         p = ngx_cpymem(p, nonce.data, nonce.len);
+        p = ngx_cpymem(p, "; HttpOnly; Secure; SameSite=Lax; Path=/",
+                       sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1);
+    }
+
+    /* Set Cookie for PKCE code_verifier */
+    ngx_table_elt_t *set_cookie_pkce;
+    set_cookie_pkce = ngx_list_push(&r->headers_out.headers);
+    if (set_cookie_pkce == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    set_cookie_pkce->hash = 1;
+    ngx_str_set(&set_cookie_pkce->key, "Set-Cookie");
+    set_cookie_pkce->value.len = sizeof("oidc_pkce_verifier=") - 1 + verifier_b64_len
+                               + sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1;
+    set_cookie_pkce->value.data = ngx_pnalloc(r->pool, set_cookie_pkce->value.len);
+    if (set_cookie_pkce->value.data) {
+        p = set_cookie_pkce->value.data;
+        p = ngx_cpymem(p, "oidc_pkce_verifier=", sizeof("oidc_pkce_verifier=") - 1);
+        p = ngx_cpymem(p, verifier_b64, verifier_b64_len);
         p = ngx_cpymem(p, "; HttpOnly; Secure; SameSite=Lax; Path=/",
                        sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1);
     }
@@ -1012,11 +1123,31 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
             ngx_strncmp(r->uri.data, redirect_path, redirect_path_len) == 0) {
 
             if (ctx->token_attempted) {
-                /* We already attempted the token request and the phase is running again.
-                 * To avoid infinite loop, we must decline here or assume authentication
-                 * state from phase 4 logic (which is not fully implemented yet).
-                 * For now, just allow it to proceed to avoid hanging. */
-                return NGX_DECLINED;
+                /*
+                 * Token + JWKS processing is complete.  The JWKS handler stored
+                 * Set-Cookie headers on r->headers_out and the redirect target in
+                 * ctx->redirect_after_auth.  Issue the 302 here so that the
+                 * content phase (proxy_pass) cannot overwrite the status.
+                 */
+                if (ctx->claims.sub.len == 0) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "OIDC: Token/JWKS validation failed");
+                    return NGX_HTTP_FORBIDDEN;
+                }
+
+                ngx_table_elt_t *loc = ngx_list_push(&r->headers_out.headers);
+                if (loc == NULL) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                loc->hash = 1;
+                ngx_str_set(&loc->key, "Location");
+                if (ctx->redirect_after_auth.len > 0) {
+                    loc->value = ctx->redirect_after_auth;
+                } else {
+                    ngx_str_set(&loc->value, "/");
+                }
+                r->headers_out.location = loc;
+                return NGX_HTTP_MOVED_TEMPORARILY;
             }
 
             ngx_str_t code_key = ngx_string("code");
