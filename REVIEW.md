@@ -1,222 +1,436 @@
-# nginx-oidc モジュール コードレビュー
+# NGINX OIDC モジュール — ソースコードレビュー
 
 ## 概要
 
-`ngx_http_oidc_module` は、NGINX Open Source に OpenID Connect (OIDC) 認証機能を追加する C 言語製のダイナミックモジュールです。通常 NGINX Plus 限定の OIDC 連携を、OSS 版でも実現することを目的としています。
+`ngx_http_oidc_module` は、NGINX Open Source に OpenID Connect (OIDC) 認証機能を追加する C 言語製のダイナミックモジュールです。NGINX Plus 限定だった OIDC 連携を OSS 版でも実現することを目的とし、OAuth 2.0 Authorization Code Flow を実装します。
 
-外部ライブラリとして **Jansson**（JSON パース）と **OpenSSL**（将来の JWT 署名検証用）に依存しています。
+ソースは単一ファイル `ngx_http_oidc_module.c`（1167 行）にまとめられており、以下の外部ライブラリに依存します。
+
+| ライブラリ | 用途 |
+|------------|------|
+| OpenSSL (libssl / libcrypto) | 乱数生成・HMAC-SHA256 |
+| Jansson | JSON パース（ディスカバリ・トークンレスポンス） |
+| libjwt (>= 1.15.3) | JWT デコード・署名検証 |
+
+---
+
+## ファイル構成
+
+```
+nginx-oidc/
+├── ngx_http_oidc_module.c   # メインソース（1167 行）
+├── config                   # NGINX モジュールビルド設定
+├── README.md                # 要件定義
+├── TASK.md                  # 開発フェーズチェックリスト
+├── TEST.md                  # テスト手順・ビルド手順
+└── REVIEW.md                # 本ファイル
+```
 
 ---
 
 ## データ構造
 
-```
-ngx_http_oidc_loc_conf_t   ← nginx.conf のディレクティブ設定値
-ngx_http_oidc_ctx_t        ← リクエストごとの状態管理
-ngx_http_oidc_provider_metadata_t  ← IdP ディスカバリで取得したエンドポイント情報
+```c
+// OIDCプロバイダのエンドポイント情報（Discoveryから取得）
+typedef struct {
+    ngx_str_t authorization_endpoint;  // 認可エンドポイントURL
+    ngx_str_t token_endpoint;          // トークンエンドポイントURL
+    ngx_str_t jwks_uri;                // JWKSエンドポイントURL
+} ngx_http_oidc_provider_metadata_t;
+
+// IDトークンから抽出したクレーム
+typedef struct {
+    ngx_str_t sub;    // ユーザー識別子
+    ngx_str_t email;  // メールアドレス
+    ngx_str_t name;   // 表示名
+} ngx_http_oidc_claims_t;
+
+// グローバル設定（ワーカープロセス内でキャッシュ）
+typedef struct {
+    ngx_http_oidc_provider_metadata_t *metadata;  // プロバイダメタデータ
+    time_t discovery_expires;                      // キャッシュ有効期限（現在未使用）
+    u_char hmac_secret[32];                        // セッションCookie署名用秘密鍵
+    ngx_uint_t secret_initialized:1;               // 秘密鍵初期化済みフラグ
+} ngx_http_oidc_main_conf_t;
+
+// ロケーション設定（nginx.conf から読み込み）
+typedef struct {
+    ngx_flag_t  auth_oidc;      // OIDC認証の有効/無効
+    ngx_str_t   oidc_provider;  // プロバイダのベースURL
+    ngx_str_t   client_id;      // OAuthクライアントID
+    ngx_str_t   client_secret;  // OAuthクライアントシークレット
+    ngx_str_t   redirect_uri;   // コールバックURI
+} ngx_http_oidc_loc_conf_t;
+
+// リクエストコンテキスト（リクエスト単位で保持）
+typedef struct {
+    ngx_http_oidc_provider_metadata_t *metadata;  // メタデータへのポインタ
+    ngx_uint_t discovery_attempted:1;              // ディスカバリ試行済みフラグ
+    ngx_uint_t token_attempted:1;                  // トークン取得試行済みフラグ
+    ngx_str_t id_token;                            // 取得したIDトークン文字列
+    ngx_http_oidc_claims_t claims;                 // 検証済みクレーム
+} ngx_http_oidc_ctx_t;
 ```
 
-- **`loc_conf`** は設定ファイル読み込み時に確定し、ワーカープロセス間で共有されます。
-- **`ctx`** はリクエストプールに確保され、リクエストが終わると解放されます。
-- **`metadata`** は `ctx` 内に保持されますが、**リクエストをまたいで共有されない**点が設計上の大きな問題です（後述）。
+- **`ngx_http_oidc_main_conf_t`** はワーカープロセス起動時に確保され、プロバイダメタデータのキャッシュおよび HMAC 秘密鍵を保持します。
+- **`ngx_http_oidc_loc_conf_t`** は設定ファイル読み込み時に確定し、ロケーションごとの OIDC 設定を保持します。
+- **`ngx_http_oidc_ctx_t`** はリクエストプールに確保され、リクエストが終わると解放されます。
 
 ---
 
-## 処理の全体フロー
+## 全体の処理フロー
 
 ```
-[NGINX 起動]
-    │
-    └─ ngx_http_oidc_init()
-         └─ ACCESS_PHASE に ngx_http_oidc_access_handler を登録
-
-[HTTPリクエスト受信]
-    │
-    └─ ngx_http_oidc_access_handler()          # メインハンドラ
-         │
-         ├─ auth_oidc が "off" または未設定 → NGX_DECLINED（素通り）
-         ├─ サブリクエスト自身 (r != r->main) → NGX_DECLINED（ループ防止）
-         │
-         ├─ [ctx 生成または取得]
-         │
-         ├─ ctx->metadata が NULL の場合
-         │    ├─ discovery_attempted フラグが立っている → 500 エラー（失敗済み）
-         │    └─ ngx_http_oidc_start_discovery()
-         │         ├─ /_oidc_discovery?url=<provider>/.well-known/openid-configuration
-         │         │  へサブリクエスト発行
-         │         └─ NGX_AGAIN を返す（非同期待機）
-         │              │
-         │              └─ ngx_http_oidc_discovery_handler()  # サブリクエスト完了コールバック
-         │                   ├─ HTTP ステータス確認
-         │                   ├─ レスポンスボディ取得
-         │                   └─ ngx_http_oidc_parse_discovery_json()
-         │                        └─ authorization_endpoint / token_endpoint / jwks_uri を抽出
-         │                           → ctx->metadata に格納
-         │
-         └─ ctx->metadata が非 NULL の場合
-              │
-              ├─ URI が redirect_uri と一致する場合（IdP からのコールバック）
-              │    ├─ token_attempted フラグが立っている → NGX_DECLINED（ループ回避）
-              │    ├─ クエリパラメータから code を取得
-              │    └─ ngx_http_oidc_start_token_request()
-              │         ├─ code, client_id, client_secret, redirect_uri を URL エンコード
-              │         ├─ /_oidc_token へサブリクエスト発行（POST ボディとして渡す）
-              │         └─ NGX_AGAIN を返す（非同期待機）
-              │              │
-              │              └─ ngx_http_oidc_token_handler()  # サブリクエスト完了コールバック
-              │                   ├─ JSON をパースして id_token / access_token の存在確認
-              │                   ├─ (Phase 4 未実装) JWT 検証・Cookie 設定
-              │                   └─ r->parent->write_event_handler = ngx_http_core_run_phases
-              │                      で親リクエストを再開
-              │
-              └─ コールバック以外のパス
-                   ├─ Cookie ヘッダを走査して "oidc_auth=" の存在確認
-                   ├─ Cookie あり → NGX_DECLINED（認証済みとして素通り）
-                   └─ Cookie なし → ngx_http_oidc_redirect_to_idp()
-                        ├─ authorization_endpoint に以下のパラメータを付加
-                        │   response_type=code, scope=openid, client_id,
-                        │   redirect_uri, state, nonce
-                        └─ 302 リダイレクトを返す
+ブラウザ                   NGINX（本モジュール）                IdP（Keycloak等）
+   |                             |                                    |
+   |─── GET /protected ─────────>|                                    |
+   |                        [access_handler]                          |
+   |                        mcf->metadata == NULL?                    |
+   |                             |──── GET /_oidc_discovery ─────────>|
+   |                             |    ?url=.../openid-configuration   |
+   |                             |<──── 200 JSON ─────────────────────|
+   |                        [discovery_handler]                       |
+   |                        JSON をパースして mcf->metadata に保存    |
+   |                        親リクエストを再開                        |
+   |                             |                                    |
+   |                        [access_handler 再実行]                   |
+   |                        oidc_auth Cookie なし？                   |
+   |                        → state / nonce を RAND_bytes で生成      |
+   |<── 302 + Set-Cookie ────────|                                    |
+   |   (oidc_state=HEX64, oidc_nonce=HEX64; HttpOnly)                |
+   |                                                                  |
+   |─── GET /authorize ──────────────────────────────────────────────>|
+   |   ?response_type=code&scope=openid&client_id=...                 |
+   |   &redirect_uri=...&state=HEX64&nonce=HEX64                     |
+   |                         （ユーザーがIdPでログイン）              |
+   |<── 302 /callback?code=AUTH_CODE&state=HEX64 ────────────────────|
+   |                                                                  |
+   |─── GET /callback?code=...&state=HEX64 ─────────────────────────>|
+   |                        [access_handler]                          |
+   |                        URI == redirect_uri ?                     |
+   |                        state パラメータ ≠ oidc_state Cookie      |
+   |                          → 403 Forbidden                        |
+   |                        一致 → トークンリクエスト開始            |
+   |                             |──── POST /_oidc_token ────────────>|
+   |                             |    code=...&client_id=...          |
+   |                             |<──── 200 JSON ─────────────────────|
+   |                        [token_handler]                           |
+   |                        id_token を ctx に保存                    |
+   |                        → JWKS 取得サブリクエスト開始            |
+   |                             |──── GET /_oidc_jwks ──────────────>|
+   |                             |    ?url=.../certs                  |
+   |                             |<──── 200 JWKS JSON ────────────────|
+   |                        [jwks_handler]                            |
+   |                        jwt_decode() で署名検証                   |
+   |                        exp クレーム確認（有効期限）              |
+   |                        nonce クレーム ≠ oidc_nonce Cookie        |
+   |                          → エラーログ                           |
+   |                        sub / email / name を ctx に保存         |
+   |                        HMAC-SHA256(sub:timestamp) で              |
+   |                          oidc_auth Cookie を発行                 |
+   |                        oidc_state / oidc_nonce Cookie を削除     |
+   |<── 302 Location: / ─────────|                                    |
+   |   Set-Cookie: oidc_auth=HMAC_HEX+PAYLOAD; HttpOnly; Path=/      |
+   |                                                                  |
+   |─── GET / ───────────────────>|                                   |
+   |                        [access_handler]                          |
+   |                        oidc_auth Cookie を取得                   |
+   |                        HMAC-SHA256 で署名を検証                  |
+   |                        sub を ctx->claims.sub に復元             |
+   |                        → NGX_DECLINED（通過）                   |
+   |<── 200 OK ──────────────────|                                    |
 ```
+
+---
+
+## 主要関数の解説
+
+### `ngx_http_oidc_access_handler`（行 832–1043）
+
+HTTP アクセスフェーズで呼び出されるメイン関数です。以下の順で判定します。
+
+1. `auth_oidc` が無効、またはサブリクエスト自身 (`r != r->main`) → `NGX_DECLINED`（スキップ）
+2. `mcf->metadata` が未取得かつ `discovery_attempted` が立っていない → ディスカバリ開始 (`NGX_AGAIN`)
+3. `discovery_attempted` が立っているのにメタデータがない → 500 エラー（同一リクエスト内でのリトライ防止）
+4. URI がコールバックパス (`redirect_uri`) に一致 → `state` 検証 → トークン取得開始
+5. `oidc_auth` Cookie の HMAC 検証成功 → `NGX_DECLINED`（認証済みとして通過）
+6. 上記以外（未認証） → IdP へ 302 リダイレクト
+
+---
+
+### `ngx_http_oidc_start_discovery` / `ngx_http_oidc_discovery_handler`（行 136–131）
+
+NGINX のサブリクエスト機構を使い `/_oidc_discovery` 内部ロケーションへ非同期リクエストを送ります。`ngx_http_post_subrequest_t` にコールバック関数を登録し `NGX_AGAIN` を返すことで、イベントループをブロックせずにレスポンスを待ちます。
+
+完了ハンドラ `ngx_http_oidc_discovery_handler` では Jansson の `json_loadb()` で JSON をパースし、3 つのエンドポイント URL を `mcf->metadata`（グローバルプール）へコピーします。成功後は `r->parent->write_event_handler = ngx_http_core_run_phases` で親リクエストのフェーズ処理を再開させます。
+
+---
+
+### `ngx_http_oidc_parse_discovery_json`（行 175–225）
+
+`authorization_endpoint`・`token_endpoint`・`jwks_uri` の 3 フィールドを抽出します。各文字列は `ngx_cycle->pool`（ワーカー生存期間中有効なグローバルプール）に確保されるため、リクエスト終了後もメタデータが保持されます。
+
+---
+
+### `ngx_http_oidc_redirect_to_idp`（行 713–827）
+
+`RAND_bytes()` で 32 バイトの乱数を 2 つ生成し、それぞれ 64 文字の HEX 文字列（`state`・`nonce`）に変換します。`client_id` と `redirect_uri` は `ngx_escape_uri()` でパーセントエンコードしたうえで認可エンドポイント URL に付加します。`oidc_state` と `oidc_nonce` を `HttpOnly` Cookie として発行し、302 レスポンスを返します。
+
+---
+
+### `ngx_http_oidc_start_token_request` / `ngx_http_oidc_token_handler`（行 633–381）
+
+トークンエンドポイントへの POST を模倣するため、`code`・`client_id`・`client_secret`・`redirect_uri`・`grant_type` をクエリストリング形式で組み立て、`/_oidc_token` 内部ロケーションへサブリクエストを発行します（nginx.conf 側で POST ボディに変換）。
+
+完了ハンドラ `ngx_http_oidc_token_handler` では JSON から `id_token` を取り出して `ctx->id_token` に保存し、引き続き JWKS 取得サブリクエストを連鎖させます。
+
+---
+
+### `ngx_http_oidc_start_jwks_request` / `ngx_http_oidc_jwks_handler`（行 388–628）
+
+`/_oidc_jwks` 内部ロケーション経由で `jwks_uri` から JWKS JSON を取得し、libjwt の `jwt_decode()` に渡します。この関数は JWT の署名をインラインで検証します。検証成功後は以下の順で処理します。
+
+1. `exp` クレームで有効期限を確認（`ngx_time()` との比較）
+2. `oidc_nonce` Cookie と JWT の `nonce` クレームを比較してリプレイ攻撃を防止
+3. `sub`・`email`・`name` を `ctx->claims` に保存
+4. `HMAC(EVP_sha256(), hmac_secret, payload)` で署名し `oidc_auth` Cookie を発行
+5. `oidc_state`・`oidc_nonce` Cookie を過去の日付で上書きして削除
+6. `Location: /` で 302 リダイレクト
+
+---
+
+### セッション Cookie の検証（行 1001–1033）
+
+`oidc_auth` Cookie の形式は `HMAC_HEX(64文字) + PAYLOAD` です。アクセスハンドラはペイロード部分に対して同じ HMAC を計算し、Cookie 先頭 64 文字と一致するか確認します。一致すれば `sub` を `:` 区切りで取り出して `ctx->claims.sub` に格納します。
+
+---
+
+## nginx.conf 設定例
+
+```nginx
+load_module modules/ngx_http_oidc_module.so;
+
+http {
+    server {
+        listen 80;
+
+        # Discovery サブリクエスト用（動的 proxy_pass）
+        location = /_oidc_discovery {
+            internal;
+            proxy_pass $arg_url;
+        }
+
+        # Token エンドポイント用（POST ボディに変換）
+        location = /_oidc_token {
+            internal;
+            proxy_pass http://idp.example.com/realms/myrealm/protocol/openid-connect/token;
+            proxy_method POST;
+            proxy_set_header Content-Type "application/x-www-form-urlencoded";
+            proxy_set_body $args;
+        }
+
+        # JWKS サブリクエスト用（動的 proxy_pass）
+        location = /_oidc_jwks {
+            internal;
+            proxy_pass $arg_url;
+        }
+
+        # 保護するロケーション
+        location / {
+            auth_oidc         on;
+            oidc_provider     "https://idp.example.com/realms/myrealm";
+            oidc_client_id    "my-client";
+            oidc_client_secret "secret";
+            oidc_redirect_uri "/callback";
+
+            proxy_pass http://backend;
+            proxy_set_header X-Remote-User  $oidc_claim_sub;
+            proxy_set_header X-Remote-Email $oidc_claim_email;
+            proxy_set_header X-Remote-Name  $oidc_claim_name;
+        }
+    }
+}
+```
+
+---
+
+## 公開 NGINX 変数
+
+| 変数名 | 内容 |
+|--------|------|
+| `$oidc_claim_sub` | JWT の `sub` クレーム（ユーザーID） |
+| `$oidc_claim_email` | JWT の `email` クレーム |
+| `$oidc_claim_name` | JWT の `name` クレーム |
+
+> **注意**: 認証済みセッション（`oidc_auth` Cookie による継続認証）では `sub` のみが Cookie から復元されます。`email` と `name` はセッション Cookie に含まれていないため、継続リクエストでは空になります（後述の改善点 3 参照）。
 
 ---
 
 ## 改善点
 
-以下に、セキュリティ・設計・実装の観点から問題点を整理します。
+### 🔴 重大なバグ
 
-### 🔴 重大（セキュリティ）
+#### 1. HMAC シークレットがマルチワーカー環境で共有されない
 
-#### 1. state / nonce がハードコードされている
+**該当箇所**: `ngx_http_oidc_main_conf_t.hmac_secret`（行 33）、Cookie 発行（行 539–543）、Cookie 検証（行 1003–1007）
 
-```c
-// ngx_http_oidc_redirect_to_idp(), L416-417
-ngx_str_t state = ngx_string("random_state_123");
-ngx_str_t nonce = ngx_string("random_nonce_123");
-```
-
-`state` はCSRF攻撃対策、`nonce` はリプレイ攻撃対策として使われる値です。固定値では意味をなしません。リクエストごとに暗号論的乱数（例: `RAND_bytes` from OpenSSL）で生成し、セッションと紐付けて検証する必要があります。
-
-#### 2. 認証チェックが Cookie の存在確認のみ
+`hmac_secret` は `ngx_http_oidc_main_conf_t` に格納されており、各ワーカープロセスが独立して `RAND_bytes()` で初期化します。NGINX はデフォルトで複数のワーカープロセスを持つため、**ワーカー A が発行したセッション Cookie はワーカー B では検証できず、ユーザーは断続的に再認証を強いられます**。
 
 ```c
-// ngx_http_oidc_access_handler(), L559
-if (ngx_strnstr(header[i].value.data, "oidc_auth=", header[i].value.len)) {
-    authenticated = 1;
-```
-
-`oidc_auth=` という文字列が Cookie に含まれているかを見るだけで、値の検証がありません。ブラウザから `Cookie: oidc_auth=anything` を送るだけで認証をバイパスできます。実装では、署名付きセッショントークンを発行し、サーバー側で検証する必要があります。
-
-#### 3. Phase 4（JWT 検証）が未実装
-
-```c
-// ngx_http_oidc_token_handler(), L301-302
-/* In Phase 4 we will validate this token and set a cookie.
- * For now, just assume success. */
-```
-
-`id_token` の JWT 署名検証・有効期限チェック・`nonce` 検証が行われていません。現状では IdP から返ってきた任意のトークンをそのまま信頼してしまいます。`jwks_uri` から鍵を取得して検証するロジックが必須です。
-
----
-
-### 🟠 重要（設計上の問題）
-
-#### 4. メタデータがリクエストをまたいで共有されない
-
-```c
-// ctx はリクエストプール (r->pool) に確保される
-ctx->metadata = ngx_pcalloc(r->parent->pool, sizeof(...));
-```
-
-OIDC ディスカバリ結果はプロバイダが変わらない限り不変です。しかし現状では**リクエストごとに毎回ディスカバリを行い**、リクエスト終了時にメタデータが破棄されます。共有メモリゾーン（`ngx_shared_memory_add`）やワーカープロセスレベルのキャッシュに格納すべきです。
-
-#### 5. redirect_uri の比較がパス部分のみ
-
-```c
-// ngx_http_oidc_access_handler(), L515-516
-if (conf->redirect_uri.len > 0 && r->uri.len >= conf->redirect_uri.len &&
-    ngx_strncmp(r->uri.data, conf->redirect_uri.data, conf->redirect_uri.len) == 0) {
-```
-
-`redirect_uri` に `http://example.com/callback` のようなフルURLが設定されると、`r->uri`（パスのみ）との比較が常に不一致になります。設定値からパス部分のみを抽出するか、ドキュメントでパスのみ指定するよう明記すべきです。
-
-#### 6. auth_oidc のオン/オフ判定が脆弱
-
-```c
-// ngx_http_oidc_access_handler(), L483
-if (conf->auth_oidc.len == 0 || ngx_strncmp(conf->auth_oidc.data, "off", 3) == 0) {
-```
-
-`"off"` のみ無効扱いで、`"on"` 以外の任意の値（例: `"enabled"`, `"yes"`）が設定されても有効と判定されます。NGINX 標準の `ngx_flag_t` と `ngx_conf_set_flag_slot` を使うことで、`on`/`off` のみを受け付ける型安全な実装にできます。
-
-#### 7. トークンリクエストの引数がクエリパラメータとして渡されている
-
-```c
-// ngx_http_oidc_start_token_request(), L399
-ngx_http_subrequest(r, &token_uri, &token_args, &sr, psr, NGX_HTTP_SUBREQUEST_IN_MEMORY)
-```
-
-`token_args` はクエリストリングとして内部 location の `/_oidc_token` に渡されていますが、OAuth 2.0 トークンエンドポイントへは `application/x-www-form-urlencoded` の POST ボディとして送るのが仕様です。サブリクエストでクエリパラメータを内部ロケーションに渡し、その nginx.conf 設定側でボディに変換する構成になっているとすれば明記が必要です。
-
----
-
-### 🟡 軽微（コード品質）
-
-#### 8. `ngx_http_oidc_parse_discovery_json` のメモリプール割り当てが不整合
-
-```c
-// L152-156
-metadata->authorization_endpoint.data = ngx_palloc(r->pool, ...);
-```
-
-`metadata` 自体は `r->parent->pool` に確保（L78）されているのに、その中身のデータは `r->pool`（サブリクエストのプール）に確保されています。サブリクエスト終了時にデータが解放され、親リクエストから dangling pointer になる可能性があります。データも `r->parent->pool` に確保すべきです。
-
-#### 9. Cookie パース処理が手書きで不完全
-
-```c
-// L557-563
-if (header[i].key.len == sizeof("Cookie") - 1 && ...)
-    if (ngx_strnstr(header[i].value.data, "oidc_auth=", header[i].value.len)) {
-```
-
-`ngx_strnstr` による部分文字列検索のため、`not_oidc_auth=value` のような Cookie 名にも誤ってマッチします。NGINX が提供する `ngx_http_parse_multi_header_lines` 等を利用するか、Cookie 名の境界を正確に確認する処理が必要です。
-
-#### 10. ディスカバリ失敗時にリトライ不可
-
-```c
-// L502-505
-if (ctx->discovery_attempted) {
-    ngx_log_error(..., "OIDC: Discovery failed previously");
-    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+// 各ワーカーが独自のシークレットを生成してしまう
+if (!mcf->secret_initialized) {
+    if (RAND_bytes(mcf->hmac_secret, sizeof(mcf->hmac_secret)) == 1) {
+        mcf->secret_initialized = 1;
+    }
 }
 ```
 
-一度失敗すると次のリクエストでも 500 を返し続けます（`ctx` はリクエストごとに新規生成されるため、実際には毎リクエストでリトライするのですが、コードの意図と挙動が乖離しています）。メタデータキャッシュを正しく実装した上で、失敗時のバックオフ戦略を検討してください。
-
-#### 11. `ngx_http_oidc_discovery_handler` でエラー時も `NGX_OK` を返す分岐がある
-
-JSON パース失敗時に `NGX_OK` を返しているため、`ctx->metadata` が NULL のまま後続処理が進み、`ngx_http_oidc_redirect_to_idp` で `auth_endpoint->len == 0` チェックに引っかかって 500 になります。エラーを明示的に伝播させる設計（`NGX_ERROR` を返し、呼び出し元でハンドリング）の方が意図が明確です。
+**改善策**: `nginx.conf` に `oidc_cookie_secret` ディレクティブを追加してシークレットを外部から注入するか、NGINX の共有メモリ (`ngx_shmem`) を使ってワーカー間でシークレットを共有する。プロセス起動時フック (`init_process`) でシークレットを一度だけ初期化するのが望ましい。
 
 ---
 
-## 実装フェーズの現状まとめ
+#### 2. Cookie 検証中にシークレットを再生成してしまう
+
+**該当箇所**: 行 1003–1007
+
+Cookie 発行時（行 539–543）と検証時（行 1003–1007）の両方で、`secret_initialized` フラグが未設定なら `RAND_bytes()` によるシークレット初期化が走ります。ワーカープロセスが再起動すると、Cookie 発行時とは異なるシークレットが生成されて HMAC 検証が常に失敗し、**全ユーザーが強制ログアウト**されます。
+
+---
+
+#### 3. セッション Cookie に email と name が含まれない
+
+**該当箇所**: Cookie 発行（行 550–553）、Cookie 検証（行 1022–1030）
+
+発行時のペイロードは `sub:timestamp` のみです。継続アクセス時は `oidc_claim_email` と `oidc_claim_name` が常に空になり、バックエンドアプリケーションへのヘッダ転送が機能しません。
+
+```c
+// 現状：sub と timestamp のみ
+payload.len = ngx_snprintf(payload.data, payload.len, "%V:%T",
+                           &ctx->claims.sub, ngx_time()) - payload.data;
+```
+
+**改善策**: ペイロードに `email` と `name` を含める（例: `sub:email:name:timestamp`）か、サーバーサイドのセッションストア（Redis 等）を使用する。
+
+---
+
+### 🟠 設計上の問題
+
+#### 4. 認証後のリダイレクト先が常に `/` に固定
+
+**該当箇所**: 行 606
+
+```c
+ngx_str_set(&location->value, "/");
+```
+
+ユーザーが `/admin/settings` にアクセスして認証フローに入った場合でも、認証後は必ず `/` にリダイレクトされます。
+
+**改善策**: IdP へリダイレクトする際に元のリクエスト URI を URL エンコードして `state` パラメータや専用 Cookie (`oidc_return_to`) に保存し、コールバック後に復元する。
+
+---
+
+#### 5. Cookie パース処理が複数箇所に重複
+
+同一の Cookie 走査コードが 3 箇所に分散しています。
+
+| 箇所 | 対象 Cookie |
+|------|-------------|
+| `ngx_http_oidc_jwks_handler` 行 476–505 | `oidc_nonce` |
+| `ngx_http_oidc_access_handler` 行 921–946 | `oidc_state` |
+| `ngx_http_oidc_access_handler` 行 967–999 | `oidc_auth` |
+
+**改善策**: 以下のようなヘルパー関数に集約して重複を排除する。
+
+```c
+static ngx_int_t ngx_http_oidc_get_cookie(ngx_http_request_t *r,
+    const char *name, size_t name_len, ngx_str_t *value);
+```
+
+---
+
+#### 6. ディスカバリキャッシュの有効期限が機能していない
+
+**該当箇所**: `ngx_http_oidc_main_conf_t.discovery_expires`（行 32）
+
+フィールドは定義されているものの、値がセット・参照されることはなく常に `0` です。メタデータは一度取得されると永続的にキャッシュされ続けるため、IdP が JWK を鍵ローテーションしても自動更新されません。
+
+**改善策**: ディスカバリ成功時に `mcf->discovery_expires = ngx_time() + 3600;` を設定し、アクセスハンドラで期限切れを確認してメタデータを再取得する。
+
+---
+
+#### 7. `/_oidc_discovery` の `proxy_pass $arg_url` が SSRF リスクを持つ
+
+nginx.conf の設計例として `proxy_pass $arg_url;` を使う構成が想定されています。内部ロケーション (`internal`) なので外部からは直接悪用しにくいですが、もしモジュールに URL 注入の脆弱性があれば任意の内部エンドポイントへリクエストが飛ぶ可能性があります。
+
+**改善策**: モジュール側でプロバイダ URL を設定値から組み立てたうえで、内部ロケーションには `$oidc_discovery_url` のような専用 NGINX 変数を使い、値の出所を制限する。
+
+---
+
+### 🟡 セキュリティ上の改善点
+
+#### 8. Cookie に `Secure` 属性がない
+
+**該当箇所**: 行 575, 807, 823, 589, 596
+
+すべての Cookie（`oidc_auth`・`oidc_state`・`oidc_nonce`）に `Secure` 属性がなく、HTTP 通信でも送受信されます。本番 HTTPS 環境では必須です。
+
+```c
+// 現状
+"; HttpOnly; Path=/"
+// 改善後
+"; HttpOnly; Secure; SameSite=Lax; Path=/"
+```
+
+#### 9. Cookie に `SameSite` 属性がない
+
+`SameSite=Lax` がないと、クロスサイトリクエストで Cookie が意図せず送信される可能性があります。`state` によるCSRF防止を補完する意味でも設定すべきです。
+
+#### 10. HMAC 比較がタイミング攻撃に脆弱
+
+**該当箇所**: 行 1019
+
+```c
+if (ngx_strncmp(auth_cookie.data, expected_mac_hex, 64) == 0) {
+```
+
+`ngx_strncmp` は最初の不一致で即座に返るため、応答時間の差を観測してHMACを推測するタイミング攻撃に対して脆弱です。
+
+**改善策**: OpenSSL の `CRYPTO_memcmp()` を使用する（常に全バイトを比較）。
+
+```c
+if (CRYPTO_memcmp(auth_cookie.data, expected_mac_hex, 64) == 0) {
+```
+
+---
+
+### 🟢 未実装の機能
+
+| 機能 | 説明 |
+|------|------|
+| RP-Initiated Logout | IdP の `/logout` エンドポイントへのリダイレクト |
+| リフレッシュトークン | アクセストークンの自動更新 |
+| UserInfo エンドポイント | プロフィール情報の追加取得 |
+| Token Introspection | IdP への失効確認 |
+| 元リクエスト URL の保存 | 認証後に元 URL に戻す |
+| 複数プロバイダ対応 | ロケーションごとに異なる IdP を設定 |
+| 自動テストスイート | 統合テストの自動化 |
+
+---
+
+## 実装フェーズの現状
 
 | フェーズ | 内容 | 状態 |
 |---------|------|------|
 | Phase 1 | ディレクティブ定義・設定パース | ✅ 完了 |
-| Phase 2 | OIDC Discovery（非同期 HTTP） | ✅ 完了 |
-| Phase 3 | 認証フロー・トークン交換 | ✅ 完了（ただし上記の問題あり） |
-| Phase 4 | JWT 署名検証・Cookie 発行 | ❌ 未実装 |
-| Phase 5 | テスト・最適化・共有メモリキャッシュ | ❌ 未実装 |
+| Phase 2 | OIDC Discovery（非同期サブリクエスト） | ✅ 完了 |
+| Phase 3 | 認証フロー・トークン交換・state 検証 | ✅ 完了 |
+| Phase 4 | JWT 署名検証・nonce 検証・セッション Cookie 発行 | ✅ 完了 |
+| Phase 5 | テスト・最適化・HMAC 秘密鍵の共有メモリ化 | ❌ 未着手 |
 
 ---
 
 ## まとめ
 
-コードの全体的な構造は NGINX モジュールとして適切で、非同期処理（サブリクエスト + コールバック）の設計も NGINX の作法に沿っています。しかし、**現状では本番環境での使用は推奨できません**。最低限、以下の対応が必要です。
+Authorization Code Flow の基本的な実装は完成しており、非同期サブリクエストを使った NGINX らしいノンブロッキングアーキテクチャも適切に実装されています。Phase 4 の JWT 署名検証・nonce 検証・HMAC セッション Cookie も動作しています。
 
-1. `state` / `nonce` のランダム生成と検証
-2. JWT 署名検証（Phase 4 の実装）
-3. Cookie の署名・検証によるセッション管理
-4. メタデータの共有メモリキャッシュ化
-5. メモリプール割り当ての不整合修正（`r->pool` vs `r->parent->pool`）
+ただし **HMAC シークレットのマルチプロセス問題**（改善点 1・2）は本番環境では致命的なバグであり、マルチワーカー構成では常に認証が不安定になります。また認証後のリダイレクト先の固定（改善点 4）、セッション Cookie の情報不足（改善点 3）、タイミング攻撃への対策（改善点 10）も実用化に向けて早急に対応すべき課題です。
