@@ -15,6 +15,7 @@ typedef struct {
     ngx_str_t authorization_endpoint;
     ngx_str_t token_endpoint;
     ngx_str_t jwks_uri;
+    ngx_str_t userinfo_endpoint;  /* UserInfo endpoint URL (optional) */
 } ngx_http_oidc_provider_metadata_t;
 
 /*
@@ -44,6 +45,7 @@ typedef struct {
     ngx_uint_t secret_initialized:1;
     ngx_str_t cookie_secret;    /* configured shared secret for oidc_auth cookie HMAC */
     ngx_str_t discovery_url;    /* pre-built discovery URL for SSRF protection */
+    ngx_str_t userinfo_url;     /* pre-built UserInfo URL for SSRF protection */
 } ngx_http_oidc_main_conf_t;
 
 /*
@@ -56,6 +58,7 @@ typedef struct {
     ngx_str_t    client_secret;
     ngx_str_t    redirect_uri;
     ngx_str_t    oidc_scope;      /* OAuth scopes (default: "openid") */
+    ngx_flag_t   oidc_use_userinfo;  /* call UserInfo endpoint after token (default: off) */
 } ngx_http_oidc_loc_conf_t;
 
 /*
@@ -65,6 +68,7 @@ typedef struct {
     ngx_http_oidc_provider_metadata_t *metadata;
     ngx_uint_t discovery_attempted:1;
     ngx_uint_t token_attempted:1;
+    ngx_uint_t userinfo_attempted:1;
     ngx_str_t id_token;
     ngx_str_t access_token;       /* stored for $oidc_access_token variable */
     ngx_http_oidc_claims_t claims;
@@ -239,6 +243,19 @@ static ngx_int_t ngx_http_oidc_discovery_handler(ngx_http_request_t *r, void *da
                 ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "OIDC: Discovery successful");
                 mcf->discovery_expires = ngx_time() + 3600;
                 ctx->metadata = mcf->metadata;
+
+                /* Cache userinfo URL for $oidc_userinfo_url variable (SSRF protection) */
+                if (mcf->metadata->userinfo_endpoint.len > 0 && mcf->userinfo_url.len == 0) {
+                    mcf->userinfo_url.data = ngx_palloc(ngx_cycle->pool,
+                                                         mcf->metadata->userinfo_endpoint.len + 1);
+                    if (mcf->userinfo_url.data) {
+                        ngx_memcpy(mcf->userinfo_url.data,
+                                   mcf->metadata->userinfo_endpoint.data,
+                                   mcf->metadata->userinfo_endpoint.len);
+                        mcf->userinfo_url.data[mcf->metadata->userinfo_endpoint.len] = '\0';
+                        mcf->userinfo_url.len = mcf->metadata->userinfo_endpoint.len;
+                    }
+                }
             } else {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Failed to parse discovery json");
                 mcf->metadata = NULL;
@@ -377,6 +394,18 @@ static ngx_int_t ngx_http_oidc_parse_discovery_json(ngx_http_request_t *r, const
         }
     }
 
+    json_t *userinfo_end = json_object_get(root, "userinfo_endpoint");
+    if (json_is_string(userinfo_end)) {
+        const char *val = json_string_value(userinfo_end);
+        metadata->userinfo_endpoint.len = ngx_strlen(val);
+        metadata->userinfo_endpoint.data = ngx_palloc(ngx_cycle->pool,
+                                                       metadata->userinfo_endpoint.len + 1);
+        if (metadata->userinfo_endpoint.data) {
+            ngx_memcpy(metadata->userinfo_endpoint.data, val, metadata->userinfo_endpoint.len);
+            metadata->userinfo_endpoint.data[metadata->userinfo_endpoint.len] = '\0';
+        }
+    }
+
     json_decref(root);
     return NGX_OK;
 }
@@ -393,6 +422,7 @@ static void *ngx_http_oidc_create_loc_conf(ngx_conf_t *cf) {
     }
 
     conf->auth_oidc = NGX_CONF_UNSET;
+    conf->oidc_use_userinfo = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -410,6 +440,7 @@ static char *ngx_http_oidc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *ch
     ngx_conf_merge_str_value(conf->client_secret, prev->client_secret, "");
     ngx_conf_merge_str_value(conf->redirect_uri, prev->redirect_uri, "");
     ngx_conf_merge_str_value(conf->oidc_scope, prev->oidc_scope, "openid");
+    ngx_conf_merge_value(conf->oidc_use_userinfo, prev->oidc_use_userinfo, 0);
 
     return NGX_CONF_OK;
 }
@@ -482,10 +513,34 @@ static ngx_command_t ngx_http_oidc_commands[] = {
       offsetof(ngx_http_oidc_main_conf_t, cookie_secret),
       NULL },
 
+    /*
+     * oidc_use_userinfo on|off
+     *
+     * When enabled, the module calls the UserInfo endpoint (from the
+     * discovery document) using the access_token after JWT verification.
+     * The UserInfo response is merged into the claims available via
+     * $oidc_claim_* variables and is persisted in the session cookie so
+     * that arbitrary claims (e.g. groups, roles) remain available on
+     * subsequent requests.
+     *
+     * This is required for IdPs (Google, Microsoft Azure AD) that return
+     * only minimal claims in the ID token itself.
+     * Default: off
+     */
+    { ngx_string("oidc_use_userinfo"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, oidc_use_userinfo),
+      NULL },
+
     ngx_null_command
 };
 
 static ngx_int_t ngx_http_oidc_start_jwks_request(ngx_http_request_t *r);
+static ngx_int_t ngx_http_oidc_start_userinfo_request(ngx_http_request_t *r);
+static void ngx_http_oidc_issue_session_and_redirect(ngx_http_request_t *r,
+    ngx_http_oidc_ctx_t *ctx, ngx_http_oidc_main_conf_t *mcf);
 
 /*
  * Subrequest handler for OIDC token endpoint
@@ -761,141 +816,38 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
                         }
                     }
 
-                    /* Issue HMAC signed session cookie */
-                    ngx_http_oidc_main_conf_t *mcf = ngx_http_get_module_main_conf(r->parent, ngx_http_oidc_module);
-                    if (mcf && mcf->secret_initialized) {
-                        ngx_table_elt_t *set_cookie_auth;
-                        u_char *p;
+                    /*
+                     * Issue session cookie and redirect.
+                     * If oidc_use_userinfo is enabled and we have an access_token,
+                     * delegate to the UserInfo subrequest first so that any extra
+                     * claims returned by the IdP's UserInfo endpoint are merged into
+                     * the session cookie before it is issued.
+                     */
+                    {
+                        ngx_http_oidc_loc_conf_t *lcf_ui =
+                            ngx_http_get_module_loc_conf(r->parent, ngx_http_oidc_module);
+                        ngx_http_oidc_main_conf_t *mcf_ui =
+                            ngx_http_get_module_main_conf(r->parent, ngx_http_oidc_module);
 
-                        /*
-                         * Payload format: B64(sub):B64(email):B64(name):timestamp
-                         *
-                         * Each claim is standard-Base64-encoded so that ':' characters
-                         * inside a claim value (e.g. display names like "Dr. Smith: MD")
-                         * do not corrupt the delimiter-based parsing (issue 11).
-                         * The timestamp is purely numeric and needs no encoding.
-                         */
-                        ngx_str_t sub_b64, email_b64, name_b64;
-
-                        sub_b64.len  = ((ctx->claims.sub.len   + 2) / 3) * 4;
-                        email_b64.len = ((ctx->claims.email.len + 2) / 3) * 4;
-                        name_b64.len  = ((ctx->claims.name.len  + 2) / 3) * 4;
-
-                        sub_b64.data   = ngx_palloc(r->parent->pool, sub_b64.len   + 1);
-                        email_b64.data = ngx_palloc(r->parent->pool, email_b64.len + 1);
-                        name_b64.data  = ngx_palloc(r->parent->pool, name_b64.len  + 1);
-
-                        if (sub_b64.data && email_b64.data && name_b64.data) {
-                            ngx_encode_base64(&sub_b64,   &ctx->claims.sub);
-                            ngx_encode_base64(&email_b64, &ctx->claims.email);
-                            ngx_encode_base64(&name_b64,  &ctx->claims.name);
-                        }
-
-                        ngx_str_t payload;
-                        payload.len = sub_b64.len + 1
-                                    + email_b64.len + 1
-                                    + name_b64.len + 1
-                                    + 20 + 1; /* timestamp + NUL */
-                        payload.data = ngx_palloc(r->parent->pool, payload.len);
-                        if (payload.data) {
-                            payload.len = ngx_snprintf(payload.data, payload.len,
-                                                       "%V:%V:%V:%T",
-                                                       &sub_b64,
-                                                       &email_b64,
-                                                       &name_b64,
-                                                       ngx_time()) - payload.data;
-
-                            u_char mac[32];
-                            u_char mac_hex[64];
-                            unsigned int mac_len = 0;
-
-                            HMAC(EVP_sha256(), mcf->hmac_secret, sizeof(mcf->hmac_secret),
-                                 payload.data, payload.len,
-                                 mac, &mac_len);
-                            ngx_hex_dump(mac_hex, mac, 32);
-
-                            set_cookie_auth = ngx_list_push(&r->parent->headers_out.headers);
-                            if (set_cookie_auth) {
-                                set_cookie_auth->hash = 1;
-                                ngx_str_set(&set_cookie_auth->key, "Set-Cookie");
-                                set_cookie_auth->value.len =
-                                    sizeof("oidc_auth=") - 1 + 64 + payload.len
-                                    + sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1;
-                                set_cookie_auth->value.data = ngx_pnalloc(r->parent->pool,
-                                                                          set_cookie_auth->value.len);
-                                if (set_cookie_auth->value.data) {
-                                    p = set_cookie_auth->value.data;
-                                    p = ngx_cpymem(p, "oidc_auth=", sizeof("oidc_auth=") - 1);
-                                    p = ngx_cpymem(p, mac_hex, 64);
-                                    p = ngx_cpymem(p, payload.data, payload.len);
-                                    p = ngx_cpymem(p, "; HttpOnly; Secure; SameSite=Lax; Path=/",
-                                                   sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1);
-                                }
+                        if (lcf_ui->oidc_use_userinfo == 1
+                            && ctx->access_token.len > 0
+                            && ctx->metadata != NULL
+                            && ctx->metadata->userinfo_endpoint.len > 0)
+                        {
+                            jwt_free(jwt);
+                            if (ngx_http_oidc_start_userinfo_request(r->parent) == NGX_OK) {
+                                /* UserInfo handler will issue cookie and resume parent */
+                                return NGX_OK;
                             }
-                        }
-                    }
-
-                    /* Clear state, nonce, and return_to cookies */
-                    ngx_table_elt_t *clear_state;
-                    ngx_table_elt_t *clear_nonce;
-                    ngx_table_elt_t *clear_return_to;
-
-                    clear_state = ngx_list_push(&r->parent->headers_out.headers);
-                    if (clear_state) {
-                        clear_state->hash = 1;
-                        ngx_str_set(&clear_state->key, "Set-Cookie");
-                        ngx_str_set(&clear_state->value,
-                                    "oidc_state=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
-                                    " Secure; SameSite=Lax; Path=/");
-                    }
-
-                    clear_nonce = ngx_list_push(&r->parent->headers_out.headers);
-                    if (clear_nonce) {
-                        clear_nonce->hash = 1;
-                        ngx_str_set(&clear_nonce->key, "Set-Cookie");
-                        ngx_str_set(&clear_nonce->value,
-                                    "oidc_nonce=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
-                                    " Secure; SameSite=Lax; Path=/");
-                    }
-
-                    clear_return_to = ngx_list_push(&r->parent->headers_out.headers);
-                    if (clear_return_to) {
-                        clear_return_to->hash = 1;
-                        ngx_str_set(&clear_return_to->key, "Set-Cookie");
-                        ngx_str_set(&clear_return_to->value,
-                                    "oidc_return_to=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
-                                    " Secure; SameSite=Lax; Path=/");
-                    }
-
-                    ngx_table_elt_t *clear_pkce;
-                    clear_pkce = ngx_list_push(&r->parent->headers_out.headers);
-                    if (clear_pkce) {
-                        clear_pkce->hash = 1;
-                        ngx_str_set(&clear_pkce->key, "Set-Cookie");
-                        ngx_str_set(&clear_pkce->value,
-                                    "oidc_pkce_verifier=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
-                                    " Secure; SameSite=Lax; Path=/");
-                    }
-
-                    /* Redirect to original request URI saved in oidc_return_to cookie */
-                    ngx_table_elt_t *location;
-                    location = ngx_list_push(&r->parent->headers_out.headers);
-                    if (location) {
-                        location->hash = 1;
-                        ngx_str_set(&location->key, "Location");
-
-                        ngx_str_t return_to = ngx_null_string;
-                        ngx_http_oidc_get_cookie(r->parent, "oidc_return_to",
-                                                 sizeof("oidc_return_to") - 1, &return_to);
-                        /* Validate: must start with '/' to prevent open redirect */
-                        if (return_to.len > 0 && return_to.data[0] == '/') {
-                            location->value = return_to;
-                        } else {
-                            ngx_str_set(&location->value, "/");
+                            /* Fallback: issue cookie without UserInfo */
+                            ngx_http_oidc_issue_session_and_redirect(r->parent, ctx, mcf_ui);
+                            if (r->parent) {
+                                r->parent->write_event_handler = ngx_http_core_run_phases;
+                            }
+                            return NGX_OK;
                         }
 
-                        r->parent->headers_out.status = NGX_HTTP_MOVED_TEMPORARILY;
-                        r->parent->headers_out.location = location;
+                        ngx_http_oidc_issue_session_and_redirect(r->parent, ctx, mcf_ui);
                     }
 
                 } else {
@@ -912,6 +864,419 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
 
     if (r->parent) {
         r->parent->write_event_handler = ngx_http_core_run_phases;
+    }
+
+    return NGX_OK;
+}
+
+/*
+ * Issue HMAC-signed session cookie and 302 redirect to the original URI.
+ *
+ * Cookie payload format:
+ *   B64(sub):B64(email):B64(name):timestamp[|B64(key1):B64(val1)|B64(key2):B64(val2)...]
+ *
+ * The three fixed claims (sub/email/name) are always written first using
+ * standard Base64 with ':' as separator (issue 11 fix).  Arbitrary JWT
+ * claims from extra_claims are appended after a '|' delimiter, each as
+ * B64(key):B64(val) pairs separated by '|'.  The total payload is capped
+ * at OIDC_SESSION_MAX_PAYLOAD bytes so that the cookie stays within the
+ * browser's 4096-byte cookie limit.
+ */
+#define OIDC_SESSION_MAX_PAYLOAD 3500
+
+static void
+ngx_http_oidc_issue_session_and_redirect(ngx_http_request_t *r,
+    ngx_http_oidc_ctx_t *ctx, ngx_http_oidc_main_conf_t *mcf)
+{
+    if (mcf == NULL || !mcf->secret_initialized) {
+        return;
+    }
+
+    u_char *p;
+
+    /* --- Base64-encode fixed claims --- */
+    ngx_str_t sub_b64, email_b64, name_b64;
+
+    sub_b64.len   = ((ctx->claims.sub.len   + 2) / 3) * 4;
+    email_b64.len = ((ctx->claims.email.len + 2) / 3) * 4;
+    name_b64.len  = ((ctx->claims.name.len  + 2) / 3) * 4;
+
+    sub_b64.data   = ngx_palloc(r->pool, sub_b64.len   + 1);
+    email_b64.data = ngx_palloc(r->pool, email_b64.len + 1);
+    name_b64.data  = ngx_palloc(r->pool, name_b64.len  + 1);
+
+    if (sub_b64.data == NULL || email_b64.data == NULL || name_b64.data == NULL) {
+        return;
+    }
+
+    ngx_encode_base64(&sub_b64,   &ctx->claims.sub);
+    ngx_encode_base64(&email_b64, &ctx->claims.email);
+    ngx_encode_base64(&name_b64,  &ctx->claims.name);
+
+    /* --- Calculate base payload length: B64(sub):B64(email):B64(name):timestamp --- */
+    size_t base_len = sub_b64.len + 1 + email_b64.len + 1 + name_b64.len + 1 + 20;
+    /* 20 bytes is sufficient for a Unix timestamp */
+
+    /* --- Calculate extra claims length --- */
+    size_t extra_len = 0;
+    if (ctx->extra_claims != NULL) {
+        ngx_http_oidc_claim_entry_t *entries = ctx->extra_claims->elts;
+        ngx_uint_t i;
+        for (i = 0; i < ctx->extra_claims->nelts; i++) {
+            size_t klen = ((entries[i].key.len   + 2) / 3) * 4;
+            size_t vlen = ((entries[i].value.len + 2) / 3) * 4;
+            size_t entry_len = 1 + klen + 1 + vlen; /* |B64(key):B64(val) */
+            if (base_len + extra_len + entry_len > OIDC_SESSION_MAX_PAYLOAD) {
+                break;
+            }
+            extra_len += entry_len;
+        }
+    }
+
+    size_t payload_max = base_len + extra_len + 1; /* +1 for NUL */
+    u_char *payload_buf = ngx_palloc(r->pool, payload_max);
+    if (payload_buf == NULL) {
+        return;
+    }
+
+    /* Write base payload */
+    p = payload_buf;
+    p = ngx_snprintf(p, base_len + 1, "%V:%V:%V:%T",
+                     &sub_b64, &email_b64, &name_b64, ngx_time());
+
+    /* Append extra claims: |B64(key):B64(val) */
+    if (ctx->extra_claims != NULL) {
+        ngx_http_oidc_claim_entry_t *entries = ctx->extra_claims->elts;
+        ngx_uint_t i;
+        size_t written_extra = 0;
+        for (i = 0; i < ctx->extra_claims->nelts; i++) {
+            size_t klen = ((entries[i].key.len   + 2) / 3) * 4;
+            size_t vlen = ((entries[i].value.len + 2) / 3) * 4;
+            size_t entry_len = 1 + klen + 1 + vlen;
+            if (written_extra + entry_len > extra_len) {
+                break;
+            }
+
+            ngx_str_t kb64 = { klen, ngx_palloc(r->pool, klen + 1) };
+            ngx_str_t vb64 = { vlen, ngx_palloc(r->pool, vlen + 1) };
+            if (kb64.data == NULL || vb64.data == NULL) {
+                break;
+            }
+
+            ngx_encode_base64(&kb64, &entries[i].key);
+            ngx_encode_base64(&vb64, &entries[i].value);
+
+            *p++ = '|';
+            p = ngx_cpymem(p, kb64.data, kb64.len);
+            *p++ = ':';
+            p = ngx_cpymem(p, vb64.data, vb64.len);
+            written_extra += entry_len;
+        }
+    }
+
+    size_t payload_len = p - payload_buf;
+
+    /* --- HMAC-SHA256 sign --- */
+    u_char mac[32];
+    u_char mac_hex[64];
+    unsigned int mac_len_out = 0;
+
+    HMAC(EVP_sha256(), mcf->hmac_secret, sizeof(mcf->hmac_secret),
+         payload_buf, payload_len, mac, &mac_len_out);
+    ngx_hex_dump(mac_hex, mac, 32);
+
+    /* --- Set oidc_auth cookie --- */
+    ngx_table_elt_t *set_cookie_auth = ngx_list_push(&r->headers_out.headers);
+    if (set_cookie_auth) {
+        set_cookie_auth->hash = 1;
+        ngx_str_set(&set_cookie_auth->key, "Set-Cookie");
+        set_cookie_auth->value.len = sizeof("oidc_auth=") - 1 + 64 + payload_len
+                                   + sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1;
+        set_cookie_auth->value.data = ngx_pnalloc(r->pool, set_cookie_auth->value.len);
+        if (set_cookie_auth->value.data) {
+            p = set_cookie_auth->value.data;
+            p = ngx_cpymem(p, "oidc_auth=", sizeof("oidc_auth=") - 1);
+            p = ngx_cpymem(p, mac_hex, 64);
+            p = ngx_cpymem(p, payload_buf, payload_len);
+            p = ngx_cpymem(p, "; HttpOnly; Secure; SameSite=Lax; Path=/",
+                           sizeof("; HttpOnly; Secure; SameSite=Lax; Path=/") - 1);
+        }
+    }
+
+    /* --- Clear OIDC temporary cookies --- */
+    ngx_table_elt_t *h;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h) {
+        h->hash = 1;
+        ngx_str_set(&h->key, "Set-Cookie");
+        ngx_str_set(&h->value, "oidc_state=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
+                               " Secure; SameSite=Lax; Path=/");
+    }
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h) {
+        h->hash = 1;
+        ngx_str_set(&h->key, "Set-Cookie");
+        ngx_str_set(&h->value, "oidc_nonce=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
+                               " Secure; SameSite=Lax; Path=/");
+    }
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h) {
+        h->hash = 1;
+        ngx_str_set(&h->key, "Set-Cookie");
+        ngx_str_set(&h->value, "oidc_return_to=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
+                               " Secure; SameSite=Lax; Path=/");
+    }
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h) {
+        h->hash = 1;
+        ngx_str_set(&h->key, "Set-Cookie");
+        ngx_str_set(&h->value, "oidc_pkce_verifier=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"
+                               " Secure; SameSite=Lax; Path=/");
+    }
+
+    /* --- 302 redirect to original URI --- */
+    ngx_table_elt_t *location = ngx_list_push(&r->headers_out.headers);
+    if (location) {
+        location->hash = 1;
+        ngx_str_set(&location->key, "Location");
+
+        ngx_str_t return_to = ngx_null_string;
+        ngx_http_oidc_get_cookie(r, "oidc_return_to",
+                                 sizeof("oidc_return_to") - 1, &return_to);
+        if (return_to.len > 0 && return_to.data[0] == '/') {
+            location->value = return_to;
+        } else {
+            ngx_str_set(&location->value, "/");
+        }
+
+        r->headers_out.status = NGX_HTTP_MOVED_TEMPORARILY;
+        r->headers_out.location = location;
+    }
+}
+
+/*
+ * UserInfo subrequest completion handler.
+ *
+ * Parses the IdP UserInfo JSON response and merges the returned claims into
+ * ctx->extra_claims (and updates the fixed claims sub/email/name when
+ * present).  Then issues the session cookie and redirects.
+ */
+static ngx_int_t
+ngx_http_oidc_userinfo_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
+{
+    ngx_http_oidc_ctx_t       *ctx = ngx_http_get_module_ctx(r->parent, ngx_http_oidc_module);
+    ngx_http_oidc_main_conf_t *mcf = ngx_http_get_module_main_conf(r->parent, ngx_http_oidc_module);
+
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (rc == NGX_ERROR || r->headers_out.status != NGX_HTTP_OK) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "OIDC: UserInfo request failed (status %ui), "
+                      "proceeding with ID token claims only",
+                      r->headers_out.status);
+        /* Non-fatal: issue session with whatever claims we have */
+        goto done;
+    }
+
+    if (r->upstream == NULL || r->upstream->buffer.start == NULL) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "OIDC: UserInfo request returned no buffer");
+        goto done;
+    }
+
+    {
+        u_char *json_data;
+        size_t  json_len;
+
+        json_len  = r->upstream->buffer.last - r->upstream->buffer.pos;
+        json_data = ngx_palloc(r->pool, json_len);
+        if (json_data == NULL) {
+            goto done;
+        }
+        ngx_memcpy(json_data, r->upstream->buffer.pos, json_len);
+
+        json_error_t jerr;
+        json_t *root = json_loadb((const char *) json_data, json_len, 0, &jerr);
+        if (root == NULL || !json_is_object(root)) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "OIDC: Failed to parse UserInfo JSON: %s", jerr.text);
+            if (root) json_decref(root);
+            goto done;
+        }
+
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                      "OIDC: UserInfo response parsed successfully");
+
+        /* Ensure extra_claims array exists */
+        if (ctx->extra_claims == NULL) {
+            ctx->extra_claims = ngx_array_create(r->parent->pool, 8,
+                                    sizeof(ngx_http_oidc_claim_entry_t));
+        }
+
+        const char *ukey;
+        json_t     *uval;
+        json_object_foreach(root, ukey, uval) {
+            const char *str_val = NULL;
+            char num_buf[32];
+
+            if (json_is_string(uval)) {
+                str_val = json_string_value(uval);
+            } else if (json_is_integer(uval)) {
+                ngx_snprintf((u_char *) num_buf, sizeof(num_buf),
+                             "%l%Z", (long) json_integer_value(uval));
+                str_val = num_buf;
+            }
+
+            if (str_val == NULL) {
+                continue;
+            }
+
+            /* Update fixed claims when UserInfo provides them */
+            if (ngx_strcmp(ukey, "sub") == 0) {
+                ctx->claims.sub.len  = ngx_strlen(str_val);
+                ctx->claims.sub.data = ngx_palloc(r->parent->pool, ctx->claims.sub.len);
+                if (ctx->claims.sub.data) {
+                    ngx_memcpy(ctx->claims.sub.data, str_val, ctx->claims.sub.len);
+                }
+                continue;
+            }
+            if (ngx_strcmp(ukey, "email") == 0) {
+                ctx->claims.email.len  = ngx_strlen(str_val);
+                ctx->claims.email.data = ngx_palloc(r->parent->pool, ctx->claims.email.len);
+                if (ctx->claims.email.data) {
+                    ngx_memcpy(ctx->claims.email.data, str_val, ctx->claims.email.len);
+                }
+                continue;
+            }
+            if (ngx_strcmp(ukey, "name") == 0) {
+                ctx->claims.name.len  = ngx_strlen(str_val);
+                ctx->claims.name.data = ngx_palloc(r->parent->pool, ctx->claims.name.len);
+                if (ctx->claims.name.data) {
+                    ngx_memcpy(ctx->claims.name.data, str_val, ctx->claims.name.len);
+                }
+                continue;
+            }
+
+            /* Arbitrary claim: add/overwrite in extra_claims */
+            if (ctx->extra_claims == NULL) {
+                continue;
+            }
+
+            /* Check if this key already exists (from ID token) and overwrite */
+            ngx_uint_t found = 0;
+            ngx_http_oidc_claim_entry_t *entries = ctx->extra_claims->elts;
+            ngx_uint_t ei;
+            for (ei = 0; ei < ctx->extra_claims->nelts; ei++) {
+                if (entries[ei].key.len == ngx_strlen(ukey)
+                    && ngx_strncmp(entries[ei].key.data, ukey,
+                                   entries[ei].key.len) == 0)
+                {
+                    size_t vlen = ngx_strlen(str_val);
+                    entries[ei].value.data = ngx_palloc(r->parent->pool, vlen);
+                    if (entries[ei].value.data) {
+                        entries[ei].value.len = vlen;
+                        ngx_memcpy(entries[ei].value.data, str_val, vlen);
+                    }
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                ngx_http_oidc_claim_entry_t *entry = ngx_array_push(ctx->extra_claims);
+                if (entry) {
+                    size_t klen = ngx_strlen(ukey);
+                    size_t vlen = ngx_strlen(str_val);
+                    entry->key.data   = ngx_palloc(r->parent->pool, klen);
+                    entry->key.len    = klen;
+                    entry->value.data = ngx_palloc(r->parent->pool, vlen);
+                    entry->value.len  = vlen;
+                    if (entry->key.data && entry->value.data) {
+                        ngx_memcpy(entry->key.data, ukey, klen);
+                        ngx_memcpy(entry->value.data, str_val, vlen);
+                    }
+                }
+            }
+        }
+
+        json_decref(root);
+    }
+
+done:
+    ngx_http_oidc_issue_session_and_redirect(r->parent, ctx, mcf);
+
+    if (r->parent) {
+        r->parent->write_event_handler = ngx_http_core_run_phases;
+    }
+
+    return NGX_OK;
+}
+
+/*
+ * Start UserInfo Subrequest.
+ *
+ * Issues a subrequest to /_oidc_userinfo with the access_token passed as
+ * the ?token= query parameter.  The nginx.conf internal location should set:
+ *
+ *   proxy_pass $oidc_userinfo_url;
+ *   proxy_set_header Authorization "Bearer $arg_token";
+ *
+ * The URL is pre-built from the discovery document and stored in
+ * mcf->userinfo_url (SSRF protection, same pattern as $oidc_jwks_url).
+ */
+static ngx_int_t
+ngx_http_oidc_start_userinfo_request(ngx_http_request_t *r)
+{
+    ngx_http_request_t        *sr;
+    ngx_http_post_subrequest_t *psr;
+    ngx_http_oidc_ctx_t       *ctx = ngx_http_get_module_ctx(r, ngx_http_oidc_module);
+    ngx_str_t  userinfo_uri  = ngx_string("/_oidc_userinfo");
+    ngx_str_t  userinfo_args;
+    size_t     token_enc_len;
+    u_char    *p;
+
+    if (ctx == NULL || ctx->access_token.len == 0) {
+        return NGX_ERROR;
+    }
+
+    token_enc_len = ctx->access_token.len
+                  + 2 * ngx_escape_uri(NULL, ctx->access_token.data,
+                                       ctx->access_token.len, NGX_ESCAPE_ARGS);
+
+    userinfo_args.data = ngx_palloc(r->pool, sizeof("token=") - 1 + token_enc_len + 1);
+    if (userinfo_args.data == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = userinfo_args.data;
+    p = ngx_cpymem(p, "token=", sizeof("token=") - 1);
+    if (token_enc_len == ctx->access_token.len) {
+        p = ngx_cpymem(p, ctx->access_token.data, ctx->access_token.len);
+    } else {
+        p = (u_char *) ngx_escape_uri(p, ctx->access_token.data,
+                                       ctx->access_token.len, NGX_ESCAPE_ARGS);
+    }
+    userinfo_args.len = p - userinfo_args.data;
+
+    psr = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
+    if (psr == NULL) {
+        return NGX_ERROR;
+    }
+
+    psr->handler = ngx_http_oidc_userinfo_handler;
+    psr->data    = NULL;
+
+    ctx->userinfo_attempted = 1;
+
+    if (ngx_http_subrequest(r, &userinfo_uri, &userinfo_args, &sr,
+                            psr, NGX_HTTP_SUBREQUEST_IN_MEMORY) != NGX_OK)
+    {
+        return NGX_ERROR;
     }
 
     return NGX_OK;
@@ -1411,6 +1776,53 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
                                         ctx->claims.name = dec;
                                     }
                                 }
+
+                                /*
+                                 * Restore arbitrary claims persisted in the cookie.
+                                 * Format after the timestamp field: |B64(key):B64(val)|...
+                                 * The '|' sentinel separates the base claims section
+                                 * (sub:email:name:timestamp) from the extra claims section.
+                                 */
+                                u_char *pipe = ngx_strlchr(c3 + 1, pl_end, '|');
+                                if (pipe != NULL) {
+                                    u_char *ep = pipe + 1;
+                                    while (ep < pl_end) {
+                                        u_char *next_pipe = ngx_strlchr(ep, pl_end, '|');
+                                        u_char *claim_end = next_pipe ? next_pipe : pl_end;
+                                        u_char *colon     = ngx_strlchr(ep, claim_end, ':');
+                                        if (colon) {
+                                            ngx_str_t kenc_e = { colon - ep, ep };
+                                            ngx_str_t venc_e = { claim_end - (colon + 1), colon + 1 };
+                                            ngx_str_t kdec_e, vdec_e;
+
+                                            kdec_e.data = ngx_palloc(r->pool, kenc_e.len + 1);
+                                            kdec_e.len  = kenc_e.len;
+                                            vdec_e.data = ngx_palloc(r->pool, venc_e.len + 1);
+                                            vdec_e.len  = venc_e.len;
+
+                                            if (kdec_e.data && vdec_e.data
+                                                && ngx_decode_base64(&kdec_e, &kenc_e) == NGX_OK
+                                                && ngx_decode_base64(&vdec_e, &venc_e) == NGX_OK)
+                                            {
+                                                if (ctx->extra_claims == NULL) {
+                                                    ctx->extra_claims = ngx_array_create(
+                                                        r->pool, 8,
+                                                        sizeof(ngx_http_oidc_claim_entry_t));
+                                                }
+                                                if (ctx->extra_claims) {
+                                                    ngx_http_oidc_claim_entry_t *entry =
+                                                        ngx_array_push(ctx->extra_claims);
+                                                    if (entry) {
+                                                        entry->key   = kdec_e;
+                                                        entry->value = vdec_e;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (next_pipe == NULL) break;
+                                        ep = next_pipe + 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1548,7 +1960,8 @@ static ngx_int_t ngx_http_oidc_discovery_url_variable(ngx_http_request_t *r, ngx
  * $oidc_jwks_url — the JWKS URI obtained from the IdP discovery document.
  * For use in nginx.conf proxy_pass instead of proxy_pass $arg_url (issue 7).
  */
-static ngx_int_t ngx_http_oidc_jwks_url_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data) {
+static ngx_int_t ngx_http_oidc_jwks_url_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data) {
     ngx_http_oidc_main_conf_t *mcf = ngx_http_get_module_main_conf(r, ngx_http_oidc_module);
     if (mcf && mcf->metadata && mcf->metadata->jwks_uri.len > 0) {
         v->len = mcf->metadata->jwks_uri.len;
@@ -1556,6 +1969,28 @@ static ngx_int_t ngx_http_oidc_jwks_url_variable(ngx_http_request_t *r, ngx_http
         v->no_cacheable = 0;
         v->not_found = 0;
         v->data = mcf->metadata->jwks_uri.data;
+    } else {
+        v->not_found = 1;
+    }
+    return NGX_OK;
+}
+
+/*
+ * $oidc_userinfo_url — the UserInfo URI obtained from the IdP discovery
+ * document.  For use in nginx.conf proxy_pass for the /_oidc_userinfo
+ * internal location (SSRF protection).
+ */
+static ngx_int_t
+ngx_http_oidc_userinfo_url_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_oidc_main_conf_t *mcf = ngx_http_get_module_main_conf(r, ngx_http_oidc_module);
+    if (mcf && mcf->userinfo_url.len > 0) {
+        v->len         = mcf->userinfo_url.len;
+        v->valid       = 1;
+        v->no_cacheable = 0;
+        v->not_found   = 0;
+        v->data        = mcf->userinfo_url.data;
     } else {
         v->not_found = 1;
     }
@@ -1647,6 +2082,12 @@ static ngx_int_t ngx_http_oidc_init(ngx_conf_t *cf) {
     var = ngx_http_add_variable(cf, &jwks_url_name, NGX_HTTP_VAR_NOCACHEABLE);
     if (var == NULL) return NGX_ERROR;
     var->get_handler = ngx_http_oidc_jwks_url_variable;
+    var->data = 0;
+
+    ngx_str_t userinfo_url_name = ngx_string("oidc_userinfo_url");
+    var = ngx_http_add_variable(cf, &userinfo_url_name, NGX_HTTP_VAR_NOCACHEABLE);
+    if (var == NULL) return NGX_ERROR;
+    var->get_handler = ngx_http_oidc_userinfo_url_variable;
     var->data = 0;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
