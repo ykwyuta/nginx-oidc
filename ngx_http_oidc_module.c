@@ -27,6 +27,14 @@ typedef struct {
 } ngx_http_oidc_claims_t;
 
 /*
+ * Key-value entry for arbitrary JWT claims ($oidc_claim_<name>)
+ */
+typedef struct {
+    ngx_str_t key;
+    ngx_str_t value;
+} ngx_http_oidc_claim_entry_t;
+
+/*
  * Main Configuration Structure (for caching)
  */
 typedef struct {
@@ -60,6 +68,7 @@ typedef struct {
     ngx_str_t id_token;
     ngx_str_t access_token;       /* stored for $oidc_access_token variable */
     ngx_http_oidc_claims_t claims;
+    ngx_array_t *extra_claims;    /* arbitrary JWT claims for $oidc_claim_* prefix vars */
 } ngx_http_oidc_ctx_t;
 
 /* Forward declaration for ngx_http_oidc_module */
@@ -695,6 +704,61 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
                         ctx->claims.name.len = ngx_strlen(name);
                         ctx->claims.name.data = ngx_palloc(r->parent->pool, ctx->claims.name.len);
                         ngx_memcpy(ctx->claims.name.data, name, ctx->claims.name.len);
+                    }
+
+                    /*
+                     * Extract all JWT grants into extra_claims so that any
+                     * $oidc_claim_<name> variable is accessible during this
+                     * request (e.g. groups, roles, tenant_id).
+                     *
+                     * Note: extra_claims is only populated on the initial
+                     * authentication request.  Subsequent requests rely on the
+                     * oidc_auth session cookie which carries only sub/email/name.
+                     */
+                    {
+                        char *grants_json = jwt_get_grants_json(jwt, NULL);
+                        if (grants_json != NULL) {
+                            json_error_t jerr;
+                            json_t *grants = json_loads(grants_json, 0, &jerr);
+                            free(grants_json);
+                            if (grants && json_is_object(grants)) {
+                                const char *gkey;
+                                json_t *gval;
+                                ctx->extra_claims = ngx_array_create(r->parent->pool, 8,
+                                                        sizeof(ngx_http_oidc_claim_entry_t));
+                                if (ctx->extra_claims != NULL) {
+                                    json_object_foreach(grants, gkey, gval) {
+                                        const char *str_val = NULL;
+                                        char num_buf[32];
+                                        if (json_is_string(gval)) {
+                                            str_val = json_string_value(gval);
+                                        } else if (json_is_integer(gval)) {
+                                            ngx_snprintf((u_char *) num_buf, sizeof(num_buf),
+                                                         "%l%Z",
+                                                         (long) json_integer_value(gval));
+                                            str_val = num_buf;
+                                        }
+                                        if (str_val) {
+                                            ngx_http_oidc_claim_entry_t *entry =
+                                                ngx_array_push(ctx->extra_claims);
+                                            if (entry) {
+                                                size_t klen = ngx_strlen(gkey);
+                                                size_t vlen = ngx_strlen(str_val);
+                                                entry->key.data = ngx_palloc(r->parent->pool, klen);
+                                                entry->key.len  = klen;
+                                                entry->value.data = ngx_palloc(r->parent->pool, vlen);
+                                                entry->value.len  = vlen;
+                                                if (entry->key.data && entry->value.data) {
+                                                    ngx_memcpy(entry->key.data, gkey, klen);
+                                                    ngx_memcpy(entry->value.data, str_val, vlen);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                json_decref(grants);
+                            }
+                        }
                     }
 
                     /* Issue HMAC signed session cookie */
@@ -1364,45 +1428,86 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
     return NGX_DECLINED;
 }
 
-static ngx_int_t ngx_http_oidc_sub_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data) {
-    ngx_http_oidc_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_oidc_module);
-    if (ctx && ctx->claims.sub.len > 0) {
-        v->len = ctx->claims.sub.len;
-        v->valid = 1;
-        v->no_cacheable = 0;
-        v->not_found = 0;
-        v->data = ctx->claims.sub.data;
-    } else {
-        v->not_found = 1;
-    }
-    return NGX_OK;
-}
+/*
+ * Prefix variable handler for $oidc_claim_<name>.
+ *
+ * Handles all $oidc_claim_* variables through a single prefix handler.
+ * For the fixed claims (sub, email, name) values are restored from the
+ * oidc_auth session cookie on every request.  For arbitrary claims
+ * (e.g. $oidc_claim_groups, $oidc_claim_roles) values are only available
+ * during the initial authentication request when the JWT is verified;
+ * they are NOT persisted in the session cookie.
+ *
+ * The NGINX prefix-variable mechanism sets data = (uintptr_t) &ngx_str_t
+ * where the ngx_str_t holds the full variable name including the prefix.
+ */
+static ngx_int_t
+ngx_http_oidc_claim_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v,
+    uintptr_t data)
+{
+    ngx_str_t                    *varname = (ngx_str_t *) data;
+    ngx_http_oidc_ctx_t          *ctx;
+    ngx_str_t                     claim_name;
+    ngx_str_t                    *claim_val = NULL;
+    ngx_http_oidc_claim_entry_t  *entries;
+    ngx_uint_t                    i;
 
-static ngx_int_t ngx_http_oidc_email_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data) {
-    ngx_http_oidc_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_oidc_module);
-    if (ctx && ctx->claims.email.len > 0) {
-        v->len = ctx->claims.email.len;
-        v->valid = 1;
-        v->no_cacheable = 0;
-        v->not_found = 0;
-        v->data = ctx->claims.email.data;
-    } else {
-        v->not_found = 1;
-    }
-    return NGX_OK;
-}
+    /* Strip the "oidc_claim_" prefix (11 chars) to obtain claim name */
+    claim_name.data = varname->data + (sizeof("oidc_claim_") - 1);
+    claim_name.len  = varname->len  - (sizeof("oidc_claim_") - 1);
 
-static ngx_int_t ngx_http_oidc_name_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data) {
-    ngx_http_oidc_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_oidc_module);
-    if (ctx && ctx->claims.name.len > 0) {
-        v->len = ctx->claims.name.len;
-        v->valid = 1;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_oidc_module);
+    if (ctx == NULL) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    /* Check the three fixed claims first (always available from session cookie) */
+    if (claim_name.len == sizeof("sub") - 1
+        && ngx_strncmp(claim_name.data, "sub", claim_name.len) == 0)
+    {
+        if (ctx->claims.sub.len > 0) {
+            claim_val = &ctx->claims.sub;
+        }
+    } else if (claim_name.len == sizeof("email") - 1
+               && ngx_strncmp(claim_name.data, "email", claim_name.len) == 0)
+    {
+        if (ctx->claims.email.len > 0) {
+            claim_val = &ctx->claims.email;
+        }
+    } else if (claim_name.len == sizeof("name") - 1
+               && ngx_strncmp(claim_name.data, "name", claim_name.len) == 0)
+    {
+        if (ctx->claims.name.len > 0) {
+            claim_val = &ctx->claims.name;
+        }
+    } else {
+        /* Search extra_claims for arbitrary JWT claims */
+        if (ctx->extra_claims != NULL) {
+            entries = ctx->extra_claims->elts;
+            for (i = 0; i < ctx->extra_claims->nelts; i++) {
+                if (entries[i].key.len == claim_name.len
+                    && ngx_strncasecmp(entries[i].key.data,
+                                       claim_name.data,
+                                       claim_name.len) == 0)
+                {
+                    claim_val = &entries[i].value;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (claim_val != NULL && claim_val->len > 0) {
+        v->len         = claim_val->len;
+        v->valid       = 1;
         v->no_cacheable = 0;
-        v->not_found = 0;
-        v->data = ctx->claims.name.data;
+        v->not_found   = 0;
+        v->data        = claim_val->data;
     } else {
         v->not_found = 1;
     }
+
     return NGX_OK;
 }
 
@@ -1508,22 +1613,22 @@ static ngx_int_t ngx_http_oidc_init(ngx_conf_t *cf) {
     ngx_http_core_main_conf_t  *cmcf;
     ngx_http_variable_t        *var;
 
-    ngx_str_t sub_name = ngx_string("oidc_claim_sub");
-    var = ngx_http_add_variable(cf, &sub_name, NGX_HTTP_VAR_NOCACHEABLE);
+    /*
+     * Register $oidc_claim_* as a prefix variable.  A single handler covers
+     * all claim names: the three fixed claims (sub, email, name) restored from
+     * the session cookie, plus any arbitrary claim extracted from the JWT on
+     * the initial authentication request.
+     *
+     * Examples:
+     *   proxy_set_header X-Remote-User   $oidc_claim_sub;
+     *   proxy_set_header X-Remote-Groups $oidc_claim_groups;
+     *   proxy_set_header X-Tenant-ID     $oidc_claim_tenant_id;
+     */
+    ngx_str_t claim_prefix = ngx_string("oidc_claim_");
+    var = ngx_http_add_variable(cf, &claim_prefix,
+                                NGX_HTTP_VAR_PREFIX | NGX_HTTP_VAR_NOCACHEABLE);
     if (var == NULL) return NGX_ERROR;
-    var->get_handler = ngx_http_oidc_sub_variable;
-    var->data = 0;
-
-    ngx_str_t email_name = ngx_string("oidc_claim_email");
-    var = ngx_http_add_variable(cf, &email_name, NGX_HTTP_VAR_NOCACHEABLE);
-    if (var == NULL) return NGX_ERROR;
-    var->get_handler = ngx_http_oidc_email_variable;
-    var->data = 0;
-
-    ngx_str_t name_name = ngx_string("oidc_claim_name");
-    var = ngx_http_add_variable(cf, &name_name, NGX_HTTP_VAR_NOCACHEABLE);
-    if (var == NULL) return NGX_ERROR;
-    var->get_handler = ngx_http_oidc_name_variable;
+    var->get_handler = ngx_http_oidc_claim_variable;
     var->data = 0;
 
     ngx_str_t at_name = ngx_string("oidc_access_token");
