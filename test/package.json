@@ -1,0 +1,19 @@
+{
+  "name": "nginx-oidc-tests",
+  "version": "1.0.0",
+  "description": "E2E tests for NGINX OIDC Module",
+  "main": "mock-idp.js",
+  "scripts": {
+    "start-idp": "node mock-idp.js",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "test:debug": "playwright test --debug"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.1"
+  }
+}
