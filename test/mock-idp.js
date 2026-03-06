@@ -126,7 +126,7 @@ app.get('/userinfo', (req, res) => {
     sub: 'user-123',
     email: 'testuser@example.com',
     name: 'Test User',
-    groups: ['admin', 'user'],
+    groups: 'admin,user',
     tenant_id: 'tenant-456'
   });
 });

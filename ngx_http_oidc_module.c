@@ -69,6 +69,7 @@ typedef struct {
     ngx_uint_t discovery_attempted:1;
     ngx_uint_t token_attempted:1;
     ngx_uint_t userinfo_attempted:1;
+    ngx_uint_t redirect_issued:1;  /* set after 302 headers are prepared; access handler returns 302 */
     ngx_str_t id_token;
     ngx_str_t access_token;       /* stored for $oidc_access_token variable */
     ngx_http_oidc_claims_t claims;
@@ -1061,6 +1062,20 @@ ngx_http_oidc_issue_session_and_redirect(ngx_http_request_t *r,
         r->headers_out.status = NGX_HTTP_MOVED_TEMPORARILY;
         r->headers_out.location = location;
     }
+
+    /*
+     * Signal to the access handler that the 302 redirect headers are ready.
+     * When ngx_http_core_run_phases resumes the parent request, the access
+     * handler will see this flag and return NGX_HTTP_MOVED_TEMPORARILY so
+     * that NGINX finalises the request with the 302 response instead of
+     * falling through to the content phase (proxy_pass).
+     */
+    {
+        ngx_http_oidc_ctx_t *ctx_r = ngx_http_get_module_ctx(r, ngx_http_oidc_module);
+        if (ctx_r) {
+            ctx_r->redirect_issued = 1;
+        }
+    }
 }
 
 /*
@@ -1675,12 +1690,22 @@ static ngx_int_t ngx_http_oidc_access_handler(ngx_http_request_t *r) {
         if (redirect_path_len > 0 && r->uri.len >= redirect_path_len &&
             ngx_strncmp(r->uri.data, redirect_path, redirect_path_len) == 0) {
 
+            if (ctx->redirect_issued) {
+                /*
+                 * ngx_http_oidc_issue_session_and_redirect() has already set
+                 * the 302 Location + Set-Cookie headers on this request.
+                 * Return NGX_HTTP_MOVED_TEMPORARILY so NGINX finalises the
+                 * request with the redirect response and does NOT fall through
+                 * to the content phase (proxy_pass), which would produce a
+                 * "header already sent" alert.
+                 */
+                return NGX_HTTP_MOVED_TEMPORARILY;
+            }
+
             if (ctx->token_attempted) {
-                /* We already attempted the token request and the phase is running again.
-                 * To avoid infinite loop, we must decline here or assume authentication
-                 * state from phase 4 logic (which is not fully implemented yet).
-                 * For now, just allow it to proceed to avoid hanging. */
-                return NGX_DECLINED;
+                /* Token exchange was attempted but redirect was never issued
+                 * (e.g. JWT verification failed).  Do not loop. */
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
 
             ngx_str_t code_key = ngx_string("code");
