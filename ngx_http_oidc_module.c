@@ -551,16 +551,19 @@ static ngx_int_t ngx_http_oidc_token_handler(ngx_http_request_t *r, void *data, 
     size_t json_len = 0;
 
     if (ctx == NULL) {
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
         return NGX_ERROR;
     }
 
     if (rc == NGX_ERROR || r->headers_out.status != NGX_HTTP_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Token request failed, status: %ui", r->headers_out.status);
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
         return NGX_ERROR;
     }
 
     if (r->upstream == NULL || r->upstream->buffer.start == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OIDC: Token request returned no upstream buffer");
+        if (r->parent) r->parent->write_event_handler = ngx_http_core_run_phases;
         return NGX_ERROR;
     }
 
@@ -571,9 +574,10 @@ static ngx_int_t ngx_http_oidc_token_handler(ngx_http_request_t *r, void *data, 
 
     if (response_body.len > 0) {
         json_len = response_body.len;
-        json_data = ngx_palloc(r->pool, json_len);
+        json_data = ngx_palloc(r->pool, json_len + 1);
         if (json_data) {
             ngx_memcpy(json_data, response_body.data, json_len);
+            json_data[json_len] = '\0';
         }
     }
 
@@ -706,9 +710,10 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
 
     if (response_body.len > 0) {
         json_len = response_body.len;
-        json_data = ngx_palloc(r->pool, json_len);
+        json_data = ngx_palloc(r->pool, json_len + 1);
         if (json_data) {
             ngx_memcpy(json_data, response_body.data, json_len);
+            json_data[json_len] = '\0';
         }
     }
 
@@ -718,7 +723,7 @@ static ngx_int_t ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, n
         jwt_t *jwt = NULL;
 
         /* libjwt >= 1.15.3 supports jwt_decode() with JWKS JSON directly */
-        int jwt_ret = jwt_decode(&jwt, (const char *)ctx->id_token.data, json_data, json_len);
+        int jwt_ret = jwt_decode(&jwt, (const char *)ctx->id_token.data, (const unsigned char *)json_data, 0);
 
         if (jwt_ret == 0 && jwt != NULL) {
             ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "OIDC: JWT decoded and signature verified successfully using JWKS");

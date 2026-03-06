@@ -109,3 +109,16 @@ OIDCのコールバック処理において、NGINXモジュールからIdPの `
 ### 今後の課題
 NGINXのCモジュール側の実装において、非同期サブリクエストを発行した後にフェーズが中断（`NGX_AGAIN`）され、再度アクセスフェーズが呼ばれた際（あるいはイベントループの別のフックで）に、多重にサブリクエストが発行されている（無限ループに近い状態）可能性があります。
 テストをパスさせるためには、C言語側の `ngx_http_oidc_module.c` 内での `ctx->token_attempted` フラグの処理や、サブリクエストの完了ハンドリングを修正する必要があります。
+### 現在の課題
+これまでの調査と修正により、以下の点は解決されました。
+1. `ngx_http_oidc_token_handler` などのサブリクエストハンドラにおいて、エラーパスでの親リクエストの再開（`r->parent->write_event_handler = ngx_http_core_run_phases;`）が行われていなかったため、無限に `NGX_AGAIN` 状態となる問題を修正しました。
+2. `jwt_decode` 関数の呼び出しにおいて、JWKS（JSON形式）を渡す際のキー長パラメータ（第4引数）を正しく `0` にし、JSONデータをヌル終端することで、エラー（22）が発生する問題を修正しました。
+
+上記修正を行っても、依然としてPlaywrightテストはタイムアウトし、NGINXエラーログに以下のようなエラーが出力されています。
+
+```
+[alert] ... header already sent while reading response header from upstream
+```
+
+これは、サブリクエストのコールバック内（`ngx_http_oidc_jwks_handler` や `ngx_http_oidc_userinfo_handler`）で `ngx_http_oidc_issue_session_and_redirect` を呼び出し、`Set-Cookie` や `Location` ヘッダを設定してリダイレクトしようとした際に、親リクエスト（メインリクエスト）が適切に完了（ファイナライズ）されず、本来のバックエンドへのプロキシ処理なども並行して実行されてしまっていることが原因と考えられます。
+現状では、サブリクエスト内からメインリクエストに `302 Redirect` を返してアクセスフェーズを適切に終了させるフロー（例: `ngx_http_finalize_request` の利用）の修正が必要です。
