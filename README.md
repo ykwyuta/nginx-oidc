@@ -1,77 +1,225 @@
 # nginx-oidc
 
-NGINX PlusのOIDC（OpenID Connect）機能と互換性のある認証モジュール（拡張機能）をNGINX Open Source向けに提供するプロジェクトです。
+NGINX Open Source 向けの OpenID Connect (OIDC) 認証ダイナミックモジュールです。NGINX Plus 限定だった OIDC 連携を OSS 版でも実現します。OAuth 2.0 Authorization Code Flow（PKCE 対応）を実装し、NGINX を Relying Party (RP) として動作させ、外部の Identity Provider (IdP) と連携したシングルサインオン (SSO) を提供します。
 
-## 1. プロジェクト概要
+## 機能
 
-本プロジェクトは、NGINX Plusで提供されているネイティブなOIDC認証機能（`ngx_http_oidc_module`）と同等の機能を、NGINX Open Source環境で利用可能にするための拡張モジュールを開発することを目的とします。NGINXをRelying Party (RP) として動作させ、外部のIdentity Provider (IdP) と連携して、バックエンドアプリケーションへのセキュアなシングルサインオン (SSO) を実現します。
+- **Authorization Code Flow + PKCE (S256)**: セキュアな認証フローを実装
+- **OIDC Discovery**: `/.well-known/openid-configuration` からエンドポイントを自動取得（TTL: 3600秒キャッシュ）
+- **JWT 署名検証**: libjwt によるIDトークンの署名検証・有効期限・nonceチェック
+- **セッション管理**: HMAC-SHA256 署名付き Cookie によるステートレスセッション
+- **クレーム変数**: `$oidc_claim_sub`, `$oidc_claim_email`, `$oidc_claim_name` および `$oidc_claim_<任意名>` 変数
+- **UserInfo エンドポイント**: `oidc_use_userinfo on` で追加クレームを取得
+- **任意クレームの永続化**: セッション Cookie に任意クレームを格納し継続アクセスでも復元
+- **SSRF 対策**: `$oidc_discovery_url` / `$oidc_jwks_url` / `$oidc_userinfo_url` 変数による URL の固定
+- **マルチワーカー対応**: `oidc_cookie_secret` ディレクティブで全ワーカー間の HMAC シークレットを統一
+- **タイミング攻撃対策**: `CRYPTO_memcmp()` による定時間 Cookie 検証
 
-## 2. 要件定義
+## 依存ライブラリ
 
-### 2.1 機能要件
+| ライブラリ | バージョン | 用途 |
+|------------|-----------|------|
+| OpenSSL (libssl / libcrypto) | 任意 | PKCE / HMAC-SHA256 / 乱数生成 / 定時間比較 |
+| Jansson | 任意 | Discovery・トークンレスポンスの JSON パース |
+| libjwt | >= 1.15.3 | IDトークンのデコード・署名検証 |
 
-* **OIDC Relying Party (RP) 機能**: OAuth 2.0のAuthorization Code Flowを用いた認証プロセスをサポートする。
-* **IdP連携とリダイレクト**: 未認証ユーザーからのアクセス要求を検知し、IdPの認証エンドポイントへ適切にリダイレクトする。
-* **トークン取得と検証**: IdPから返却された認可コードを用いて、アクセストークンおよびIDトークン（JWT）を取得し、署名の検証を行う。
-* **ユーザー情報の取得**: 必要に応じてIdPのUserInfoエンドポイントへアクセスし、追加のプロファイル情報を取得する。
-* **クレームのヘッダー付与**: 取得したOIDCクレーム（`sub`, `email`, `name`など）を変数として抽出し、バックエンドへのプロキシリクエスト時にHTTPヘッダーとして付与する機能を提供する（例: `$oidc_claim_sub`）。
-* **メタデータ自動検出（Discovery）**: IdPの `/.well-known/openid-configuration` エンドポイントを利用した、プロバイダー設定の自動取得機能。
-* **ログアウト機能**: RP-Initiated Logout（`logout_uri`, `post_logout_uri`, `logout_token_hint` 等の設定）のサポート。
-* **NGINX Plus互換の設定ディレクティブ**: `auth_oidc`, `oidc_provider`, `client_id`, `client_secret`, `issuer` など、NGINX Plusと同様のコンテキストやディレクティブ名を採用し、移行を容易にする。
+## ビルド
 
-### 2.2 非機能要件
+```bash
+# NGINX ソースと同じディレクトリで
+./configure --add-dynamic-module=/path/to/nginx-oidc
+make modules
 
-* **パフォーマンス**: NGINXの特徴である非同期・イベント駆動アーキテクチャを損なわないよう、IdPとの通信（トークン取得や公開鍵取得）はノンブロッキングで行うこと。
-* **セキュリティ**:
-    * JWTの検証における暗号アルゴリズムの厳格なチェック。
-    * クライアントシークレットやトークン情報のメモリ上での安全な取り扱い。
-    * IdPとの通信におけるTLS証明書の検証（`ssl_trusted_certificate`）。
-* **スケーラビリティ・状態管理**: セッション情報や公開鍵（JWKS）のキャッシュはNGINXの共有メモリ（Shared Memory）などを利用し、マルチワーカープロセス間でも一貫性を保ち高速に動作すること。
-* **互換性**: 標準的なNGINX Open Source環境に動的モジュール（Dynamic Module）として追加可能な構成とすること。
+# モジュールのコピー
+cp objs/ngx_http_oidc_module.so /etc/nginx/modules/
+```
 
-## 3. 実装方針
+ビルドに必要なパッケージ（Debian/Ubuntu の例）:
 
-### 3.1 アーキテクチャと技術スタック
+```bash
+apt-get install libssl-dev libjansson-dev libjwt-dev
+```
 
-NGINX PlusのOIDCモジュールと高い互換性と同等のパフォーマンスを実現するため、**C言語によるNGINXネイティブモジュール（C Module）**として実装を行います。
+## 設定
 
-* **言語**: C言語（NGINXモジュール開発標準に準拠）
-* **依存ライブラリ**:
-    * **OpenSSL**: JWTの署名検証、暗号処理、TLS通信。
-    * **Jansson** または **cJSON**: IdPから返却されるJSONレスポンス（トークン、JWKS、プロファイル情報）のパース。
-    * **libjwt** (オプション): JWTの生成・パース・検証のロジックを簡略化するため。
+### nginx.conf 設定例
 
-### 3.2 処理フローと内部実装
+```nginx
+load_module modules/ngx_http_oidc_module.so;
 
-1. **設定フェーズ**: `nginx.conf` の読み込み時に、`oidc_provider` コンテキスト内の情報を解析し、内部構造体に保存する。起動時または初回リクエスト時に、必要に応じて `.well-known` メタデータを取得する。
-2. **アクセスフェーズ（Access Phase）**:
-    * リクエストを受信した際、リクエスト内に有効なセッション（Cookieなど）が含まれているかを検証する。
-    * 認証済みであれば、トークン情報からクレーム変数を抽出し、バックエンドへプロキシ（処理の続行）。
-    * 未認証の場合、IdPの認可エンドポイントへのリダイレクトURL（stateやnonceを含む）を生成し、`302 Found` で応答する。
-3. **コールバック処理**:
-    * IdPからのコールバックリクエスト（認可コードを含む）をフックする。
-    * NGINXの **サブリクエスト機能 (`ngx_http_subrequest`)** またはそれに準ずる非同期HTTPクライアント機能を用いて、IdPのトークンエンドポイントとノンブロッキング通信を行い、トークンを取得。
-    * トークンを検証後、認証済み状態をクライアントにCookieとして発行し、元のURLへリダイレクトさせる。
+http {
+    # マルチワーカー構成では必須。全ワーカーで同一の HMAC シークレットを使用する。
+    # openssl rand -hex 32 で生成した値を設定すること。
+    oidc_cookie_secret "your-random-secret-here";
 
-### 3.3 開発フェーズ
+    server {
+        listen 443 ssl;
 
-* **Phase 1: 設定パーサーと基本構造の構築**
-  NGINX Plus互換のディレクティブ（`auth_oidc`, `oidc_provider`等）を定義し、設定情報を読み込む処理を実装。
-* **Phase 2: HTTP非同期通信とディスカバリ**
-  IdPとの通信基盤の実装。`.well-known/openid-configuration` のパースとエンドポイントURLの動的解決。
-* **Phase 3: 認証フローの実装**
-  リダイレクト処理、コールバックエンドポイントの処理、トークンの取得（サブリクエスト使用）。
-* **Phase 4: JWT検証と変数公開**
-  取得したJWTの署名検証と、NGINX内部変数（`$oidc_claim_*`）へのデータエクスポート機能の実装。セッション管理。
-* **Phase 5: テストと最適化**
-  メモリリークの検査、自動テスト（Test::Nginx等を使用）の構築、共有メモリを用いたキャッシュの最適化。
+        # Discovery サブリクエスト用（SSRF 対策: $oidc_discovery_url 変数を使用）
+        location = /_oidc_discovery {
+            internal;
+            proxy_pass $oidc_discovery_url;
+        }
 
-## 4. 設定の注意事項
+        # Token エンドポイント用（クエリパラメータを POST ボディに変換）
+        location = /_oidc_token {
+            internal;
+            proxy_pass https://idp.example.com/realms/myrealm/protocol/openid-connect/token;
+            proxy_method POST;
+            proxy_set_header Content-Type "application/x-www-form-urlencoded";
+            proxy_set_body $args;
+            proxy_set_header Content-Length "";
+        }
 
-### 4.1 内部ロケーションの設定
+        # JWKS サブリクエスト用（SSRF 対策: $oidc_jwks_url 変数を使用）
+        location = /_oidc_jwks {
+            internal;
+            proxy_pass $oidc_jwks_url;
+        }
 
-本モジュールは非同期で外部エンドポイントと通信するため、`nginx.conf` 側で以下の内部ロケーションを定義し、適切にプロキシ設定を行う必要があります。
+        # UserInfo サブリクエスト用（oidc_use_userinfo on; が必要）
+        location = /_oidc_userinfo {
+            internal;
+            proxy_pass $oidc_userinfo_url;
+            proxy_set_header Authorization "Bearer $arg_token";
+        }
 
-- `/_oidc_discovery`: OIDCプロバイダーのメタデータ(`.well-known/openid-configuration`)取得用。
-- `/_oidc_token`: トークンエンドポイントへのリクエスト用。**注意**: NGINXの仕様上、サブリクエストの引数は内部的にクエリパラメータとして渡されます。OAuth 2.0の仕様に従い `application/x-www-form-urlencoded` の POST ボディとして送信するため、設定ファイル側で `$args` をボディに変換する設定（`proxy_set_body $args;` など）が必要です。
-- `/_oidc_jwks`: JWT署名検証のための公開鍵 (JWKS) 取得用。
+        # 保護するロケーション
+        location / {
+            auth_oidc          on;
+            oidc_provider      "https://idp.example.com/realms/myrealm";
+            oidc_client_id     "my-client";
+            oidc_client_secret "secret";
+            oidc_redirect_uri  "/callback";
+            oidc_scope         "openid profile email";
+            # oidc_use_userinfo on;   # UserInfoエンドポイントから追加クレームを取得する場合
+
+            proxy_pass http://backend;
+            proxy_set_header X-Remote-User   $oidc_claim_sub;
+            proxy_set_header X-Remote-Email  $oidc_claim_email;
+            proxy_set_header X-Remote-Name   $oidc_claim_name;
+            proxy_set_header X-Remote-Groups $oidc_claim_groups;
+            # アクセストークンをバックエンドに渡す場合:
+            # proxy_set_header Authorization "Bearer $oidc_access_token";
+        }
+    }
+}
+```
+
+### ディレクティブ一覧
+
+| ディレクティブ | コンテキスト | デフォルト | 説明 |
+|--------------|------------|-----------|------|
+| `auth_oidc on\|off` | location | off | OIDC 認証の有効/無効 |
+| `oidc_provider <url>` | location | — | IdP のベース URL（Discovery に使用） |
+| `oidc_client_id <id>` | location | — | OAuth クライアント ID |
+| `oidc_client_secret <secret>` | location | — | OAuth クライアントシークレット |
+| `oidc_redirect_uri <path>` | location | — | コールバック URI のパス |
+| `oidc_scope <scope>` | location | `"openid"` | スコープ（スペース区切り） |
+| `oidc_use_userinfo on\|off` | location | off | UserInfo エンドポイントからクレームを取得 |
+| `oidc_cookie_secret <secret>` | http | — | HMAC 署名用シークレット（マルチワーカー必須） |
+
+### 内部ロケーション
+
+本モジュールは非同期サブリクエストで IdP と通信するため、以下の内部ロケーションを `nginx.conf` に定義する必要があります。
+
+| ロケーション | 用途 | 注意事項 |
+|------------|------|---------|
+| `/_oidc_discovery` | Discovery メタデータ取得 | `proxy_pass $oidc_discovery_url;` を使用（SSRF 対策） |
+| `/_oidc_token` | トークンエンドポイント | `proxy_set_body $args;` でクエリ文字列を POST ボディに変換 |
+| `/_oidc_jwks` | JWKS 取得 | `proxy_pass $oidc_jwks_url;` を使用（SSRF 対策） |
+| `/_oidc_userinfo` | UserInfo 取得 | `oidc_use_userinfo on;` 時のみ必要。`proxy_pass $oidc_userinfo_url;` を使用 |
+
+### NGINX 変数
+
+| 変数名 | 内容 |
+|--------|------|
+| `$oidc_claim_sub` | JWT の `sub` クレーム（ユーザーID） |
+| `$oidc_claim_email` | JWT の `email` クレーム |
+| `$oidc_claim_name` | JWT の `name` クレーム |
+| `$oidc_claim_<name>` | JWT / UserInfo の任意クレーム（例: `$oidc_claim_groups`, `$oidc_claim_tenant_id`） |
+| `$oidc_access_token` | アクセストークン（Bearer ヘッダ転送用） |
+| `$oidc_discovery_url` | SSRF 対策用 Discovery URL（`/_oidc_discovery` の `proxy_pass` で使用） |
+| `$oidc_jwks_url` | SSRF 対策用 JWKS URL（`/_oidc_jwks` の `proxy_pass` で使用） |
+| `$oidc_userinfo_url` | SSRF 対策用 UserInfo URL（`/_oidc_userinfo` の `proxy_pass` で使用） |
+
+継続アクセス（セッション Cookie 再利用）でも、`$oidc_claim_*` 変数はすべて Cookie から復元されます（Cookie サイズ上限: 3500 バイト）。
+
+## 認証フロー
+
+```
+ブラウザ                   NGINX（本モジュール）                IdP
+   |                             |                               |
+   |─── GET /protected ─────────>|                               |
+   |                        [Discoveryサブリクエスト]            |
+   |                             |──── GET /_oidc_discovery ────>|
+   |                             |<──── 200 JSON ────────────────|
+   |                        state/nonce/code_verifier を生成     |
+   |<── 302 Location: /authorize ─|                              |
+   |                                                             |
+   |─── GET /authorize ──────────────────────────────────────────>|
+   |                         （ユーザーがログイン）              |
+   |<── 302 /callback?code=...&state=... ────────────────────────|
+   |                                                             |
+   |─── GET /callback?code=... ─>|                               |
+   |                        state / PKCE 検証                    |
+   |                             |──── POST /_oidc_token ───────>|
+   |                             |<──── {id_token, ...} ─────────|
+   |                             |──── GET /_oidc_jwks ─────────>|
+   |                             |<──── JWKS JSON ───────────────|
+   |                        JWT署名検証・nonce確認               |
+   |                        （oidc_use_userinfo on の場合）      |
+   |                             |──── GET /_oidc_userinfo ─────>|
+   |                             |<──── {claims...} ─────────────|
+   |                        HMAC Cookie 発行                     |
+   |<── 302 Location: /protected ─|                              |
+   |                                                             |
+   |─── GET /protected ──────────>|                               |
+   |                        Cookie 検証 → クレーム復元           |
+   |<── 200 OK ──────────────────|                               |
+```
+
+## セキュリティ
+
+- **PKCE (S256)**: `code_verifier` を `oidc_pkce_verifier` Cookie に保存し、認証後に削除
+- **state / nonce**: `RAND_bytes()` で生成した 64 文字 HEX。CSRF・リプレイ攻撃を防止
+- **Cookie 属性**: すべての Cookie に `HttpOnly; Secure; SameSite=Lax; Path=/` を付与
+- **タイミング攻撃対策**: Cookie の HMAC 検証に `CRYPTO_memcmp()` を使用
+- **SSRF 対策**: `proxy_pass` に `$oidc_discovery_url` / `$oidc_jwks_url` 変数を使用し、URL の出所を設定値に限定
+- **`oidc_cookie_secret` 未設定時**: 起動ごとにランダムシークレットを生成し `WARN` ログを出力。マルチワーカー環境では Cookie の互換性が失われるため必ず設定すること
+
+## テスト
+
+`test/` ディレクトリに Playwright を使った E2E テストスイートがあります。
+
+```
+test/
+├── nginx.conf      # テスト用 NGINX 設定（Mock IdP を使用）
+└── e2e.spec.js     # Playwright E2E テスト
+```
+
+テストは以下のシナリオを検証します:
+1. 未認証アクセス → IdP へのリダイレクト
+2. ログインフォーム送信 → コールバック処理 → 元 URL への復帰
+3. JWT クレーム（`sub`, `email`, `name`, `groups`, `tenant_id`）のバックエンドへの引き渡し
+4. セッション Cookie による継続アクセスと任意クレームの復元
+
+## 実装状況
+
+| フェーズ | 内容 | 状態 |
+|---------|------|------|
+| Phase 1 | ディレクティブ定義・設定パース | 完了 |
+| Phase 2 | OIDC Discovery（非同期サブリクエスト） | 完了 |
+| Phase 3 | 認証フロー・トークン交換・PKCE・state 検証 | 完了 |
+| Phase 4 | JWT 署名検証・nonce 検証・セッション Cookie 発行 | 完了 |
+| Phase 5 | UserInfo 対応・任意クレーム永続化・SSRF 対策 | 完了 |
+
+### 未実装の機能
+
+| 機能 | 説明 |
+|------|------|
+| RP-Initiated Logout | IdP の `/logout` エンドポイントへのリダイレクト |
+| リフレッシュトークン | アクセストークンの自動更新 |
+| Token Introspection | IdP への失効確認 |
+| 複数プロバイダ対応 | ロケーションごとに異なる IdP を設定 |
+| `oidc_ssl_trusted_certificate` | 内部 CA / 自己署名証明書の信頼設定 |
