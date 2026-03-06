@@ -44,9 +44,17 @@ npx playwright install chromium
 
 ## 3. テストの実行手順
 
-テストを実行するためには、**Mock IdP**と**NGINXサーバー**をバックグラウンドで立ち上げた上で、Playwrightを実行する必要があります。
+テストを実行するためには、**Mock IdP** と **NGINXサーバー（または nginx_mock.js）** をバックグラウンドで立ち上げた上で、Playwrightを実行する必要があります。
 
-### Step 1: Mock IdPの起動
+実行方法は2通りあります。
+
+---
+
+### 方法A: 実際のNGINXを使ってテストを実行する（本番相当）
+
+NGINXバイナリと動的モジュールを使って完全なE2Eテストを行います。
+
+#### Step 1: Mock IdPの起動
 
 `test/` ディレクトリにて、Node.jsでMock IdPを起動します。デフォルトでポート `3000` を使用します。
 
@@ -55,7 +63,7 @@ npx playwright install chromium
 node mock-idp.js > idp.log 2>&1 &
 ```
 
-### Step 2: NGINXサーバーの起動
+#### Step 2: NGINXサーバーの起動
 
 テスト用の設定ファイル `test/nginx.conf` を用いて、NGINXを起動します。デフォルトでポート `8080` を使用します。
 
@@ -64,23 +72,14 @@ node mock-idp.js > idp.log 2>&1 &
 sudo /usr/sbin/nginx -c /app/test/nginx.conf -p /app > nginx.log 2>&1 &
 ```
 
-### Step 3: Playwrightテストの実行
-
-すべてのサーバーが立ち上がったら、Playwrightスクリプトを実行してブラウザテストを開始します。
+#### Step 3: Playwrightテストの実行
 
 ```bash
 # /app/test ディレクトリで実行
 npx playwright test
 ```
 
-テストの実行状況を見る場合は、UIモードやデバッグモードも利用可能です。
-```bash
-npx playwright test --ui
-```
-
-### Step 4: サーバーの停止（テスト終了後）
-
-テストが終わったら、バックグラウンドで起動しているプロセスを終了させてください。
+#### Step 4: サーバーの停止（テスト終了後）
 
 ```bash
 # Mock IdPを停止
@@ -92,33 +91,119 @@ sudo killall nginx
 
 ---
 
-## 4. 既知の問題 (Known Issues)
+### 方法B: nginx_mock.jsを使ってテストを実行する（開発・デバッグ向け）
 
-現在、Playwrightを用いたE2Eテストは**タイムアウトにより失敗（Fail）**する状態が確認されています。
+`test/nginx_mock.js` は、NGINXの動的モジュール（Cコード）が行うOIDC処理をNode.jsで再現したモックサーバーです。NGINXのビルドが不要なため、OIDCフローの動作確認やPlaywrightテストのデバッグに適しています。
 
-### 原因の概要
-OIDCのコールバック処理において、NGINXモジュールからIdPの `/token` エンドポイントに対するサブリクエストが、**なぜか2回連続して送信されてしまう**という事象が発生しています。
+`nginx_mock.js` は以下のNGINXモジュールの主要動作を再現しています：
 
-1. Playwrightがブラウザ上でログインを完了し、NGINXの `/callback?code=xxxx...` にリダイレクトされる。
-2. NGINXのアクセスフェーズ（`ngx_http_oidc_access_handler`）がトークン取得のサブリクエストをキックする。
-3. Mock IdPに1回目のトークン要求（POST `/token`）が到達し、Mock IdPは正常にコードを消費してトークンを返却する。
-4. 直後に、NGINXから全く同じ `code` を使った2回目のトークン要求（POST `/token`）が送信される。
-5. Mock IdP側ではすでに1回目のリクエストでその `code` を削除（消費）しているため、2回目のリクエストに対して `400 Bad Request (invalid_grant)` を返す。
-6. このサブリクエストの失敗により、NGINXは正しくセッションを発行できず、ブラウザ側へのレスポンスが滞り、結果的にPlaywrightのテストがタイムアウト（30秒超過）エラーとなる。
+- Cookie（`oidc_state`, `oidc_nonce`, `oidc_return_to`, `oidc_auth`）の生成・検証
+- HMAC-SHA256によるCookie署名
+- `/callback` でのトークン交換・JWT検証（簡易）・UserInfoリクエスト
+- セッションCookie発行後の302リダイレクト（`redirect_issued` フラグ相当）
+- 認証済みリクエストへのクレーム付与とJSONレスポンス
 
-### 今後の課題
-NGINXのCモジュール側の実装において、非同期サブリクエストを発行した後にフェーズが中断（`NGX_AGAIN`）され、再度アクセスフェーズが呼ばれた際（あるいはイベントループの別のフックで）に、多重にサブリクエストが発行されている（無限ループに近い状態）可能性があります。
-テストをパスさせるためには、C言語側の `ngx_http_oidc_module.c` 内での `ctx->token_attempted` フラグの処理や、サブリクエストの完了ハンドリングを修正する必要があります。
-### 現在の課題
-これまでの調査と修正により、以下の点は解決されました。
-1. `ngx_http_oidc_token_handler` などのサブリクエストハンドラにおいて、エラーパスでの親リクエストの再開（`r->parent->write_event_handler = ngx_http_core_run_phases;`）が行われていなかったため、無限に `NGX_AGAIN` 状態となる問題を修正しました。
-2. `jwt_decode` 関数の呼び出しにおいて、JWKS（JSON形式）を渡す際のキー長パラメータ（第4引数）を正しく `0` にし、JSONデータをヌル終端することで、エラー（22）が発生する問題を修正しました。
+#### Step 1: Mock IdPの起動
 
-上記修正を行っても、依然としてPlaywrightテストはタイムアウトし、NGINXエラーログに以下のようなエラーが出力されています。
+```bash
+# /app/test ディレクトリで実行
+node mock-idp.js > idp.log 2>&1 &
+```
+
+#### Step 2: nginx_mock.jsの起動（ポート8080）
+
+```bash
+# /app/test ディレクトリで実行
+node nginx_mock.js > nginx_mock.log 2>&1 &
+```
+
+#### Step 3: Playwrightテストの実行
+
+```bash
+# /app/test ディレクトリで実行
+npx playwright test
+```
+
+テストの実行状況を見る場合は、UIモードやデバッグモードも利用可能です。
+
+```bash
+npx playwright test --ui
+npx playwright test --debug
+```
+
+#### Step 4: サーバーの停止（テスト終了後）
+
+```bash
+# Mock IdPを停止
+kill $(lsof -t -i :3000)
+
+# nginx_mock.jsを停止
+kill $(lsof -t -i :8080)
+```
+
+---
+
+## 4. テストシナリオ（e2e.spec.js）
+
+`test/e2e.spec.js` に定義されているテストは以下のフローを検証します：
+
+1. ブラウザで `http://localhost:8080/protected-resource` にアクセスする
+2. NGINXがMock IdP（`http://localhost:3000/auth`）へリダイレクトすることを確認する
+3. リダイレクト先URLに `redirect_uri`, `state`, `nonce`, `client_id` パラメータが含まれることを確認する
+4. ログインフォームに `testuser` / `password` を入力して送信する
+5. 認証後、元のURLへリダイレクトされてHTTP 200が返ることを確認する
+6. レスポンスJSONに以下のクレームが含まれることを確認する：
+   - `sub`: `user-123`
+   - `email`: `testuser@example.com`
+   - `name`: `Test User`
+   - `groups`: `admin,user`
+   - `tenant_id`: `tenant-456`
+7. セッションCookieが有効で、別パス（`/another-path`）へのアクセスでも同じクレームが返ることを確認する
+
+---
+
+## 5. 実装の変遷と解決済み課題
+
+### 5.1 エラーパスでの無限ループ（解決済み）
+
+**問題**: `ngx_http_oidc_token_handler` などのサブリクエストハンドラにおいて、エラーパスで親リクエストの再開（`r->parent->write_event_handler = ngx_http_core_run_phases`）が行われていなかったため、無限に `NGX_AGAIN` 状態となる問題があった。
+
+**修正**: 各エラーパスに `r->parent->write_event_handler = ngx_http_core_run_phases` を追加し、エラー時に親リクエストのフェーズ処理を確実に再開するようにした。
+
+### 5.2 JWT検証エラー（解決済み）
+
+**問題**: `jwt_decode` 関数の呼び出しにおいて、JWKS（JSON形式）を渡す際のキー長パラメータ（第4引数）に `json_len` を渡していたため、エラー（errno 22: EINVAL）が発生していた。またJSONデータがヌル終端されていなかった。
+
+**修正**: `jwt_decode` の第4引数を `0` に変更（JWKSのJSON文字列であることをlibjwtに通知）し、動的確保するJSONバッファを `json_len + 1` バイトに増やしてヌル終端するようにした。
+
+### 5.3 "header already sent" エラーと二重レスポンス（解決済み）
+
+**問題**: コールバック処理（`/callback`）でトークン交換後に `ngx_http_oidc_issue_session_and_redirect` が `Set-Cookie` / `Location` ヘッダを設定した後、アクセスフェーズが再び呼ばれると `proxy_pass` のコンテンツフェーズも実行されてしまい、NGINXエラーログに以下のアラートが出力されてテストがタイムアウトしていた。
 
 ```
 [alert] ... header already sent while reading response header from upstream
 ```
 
-これは、サブリクエストのコールバック内（`ngx_http_oidc_jwks_handler` や `ngx_http_oidc_userinfo_handler`）で `ngx_http_oidc_issue_session_and_redirect` を呼び出し、`Set-Cookie` や `Location` ヘッダを設定してリダイレクトしようとした際に、親リクエスト（メインリクエスト）が適切に完了（ファイナライズ）されず、本来のバックエンドへのプロキシ処理なども並行して実行されてしまっていることが原因と考えられます。
-現状では、サブリクエスト内からメインリクエストに `302 Redirect` を返してアクセスフェーズを適切に終了させるフロー（例: `ngx_http_finalize_request` の利用）の修正が必要です。
+**修正**: `ngx_http_oidc_ctx_t` に `redirect_issued` フラグを追加した。`ngx_http_oidc_issue_session_and_redirect` の末尾でこのフラグを `1` に設定し、アクセスハンドラ（`ngx_http_oidc_access_handler`）の `/callback` 処理パスの先頭で `redirect_issued` が立っている場合は即座に `NGX_HTTP_MOVED_TEMPORARILY` を返すようにした。これにより、コンテンツフェーズ（`proxy_pass`）へ処理が流れなくなった。
+
+またこの修正に合わせて、トークン交換を試みたが `redirect_issued` が立っていないケース（JWTエラーなどで認証が成立しなかった場合）では `NGX_DECLINED` の代わりに `NGX_HTTP_INTERNAL_SERVER_ERROR` を返し、失敗した認証コールバックがバックエンドへ無言で転送されるのを防ぐようにした。
+
+### 5.4 groupsクレームの型不一致（解決済み）
+
+**問題**: `test/mock-idp.js` の `/userinfo` エンドポイントが `groups` をJSON配列（`["admin","user"]`）として返していたため、NGINXモジュールのUserInfoパーサーがこれを無視し（文字列・数値クレームのみを扱う実装のため）、Playwrightの `expect(body.groups).toBe('admin,user')` アサーションが失敗していた。
+
+**修正**: `mock-idp.js` の `/userinfo` エンドポイントで `groups` をカンマ区切り文字列（`"admin,user"`）として返すよう変更した。
+
+---
+
+## 6. ファイル構成
+
+| ファイル | 説明 |
+|---|---|
+| `test/e2e.spec.js` | PlaywrightのE2Eテストスクリプト |
+| `test/mock-idp.js` | Mock OIDCプロバイダ（ポート3000） |
+| `test/nginx_mock.js` | NGINXモジュールの動作をNode.jsで再現したモックサーバー（ポート8080、開発・デバッグ向け） |
+| `test/nginx.conf` | 本番相当のNGINX設定（`ngx_http_oidc_module.so` を使用） |
+| `test/playwright.config.js` | Playwrightの設定（Chromiumパス、タイムアウト） |
+| `test/package.json` | Node.js依存パッケージの定義 |
+| `ngx_http_oidc_module.c` | NGINXダイナミックモジュール本体 |
