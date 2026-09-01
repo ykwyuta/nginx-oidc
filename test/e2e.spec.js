@@ -1,64 +1,482 @@
 const { test, expect } = require('@playwright/test');
 
-test.describe('NGINX OIDC Module E2E Test', () => {
+const BASE = process.env.OIDC_TEST_BASE_URL || 'http://localhost:8080';
 
-  test('should redirect to IdP, login, and access protected resource with claims', async ({ page }) => {
+// run-e2e.sh はストアあり (store) と Cookie のみ (cookie) の両方で実行する
+const MODE = process.env.OIDC_TEST_MODE || 'store';   // store | redis | sentinel | cluster | cookie
+const STORE = MODE !== 'cookie';
 
-    // 1. Visit the protected NGINX URL
-    const nginxUrl = 'http://localhost:8080/protected-resource';
-    console.log(`Navigating to ${nginxUrl}`);
+/** IdP の認可 URL にテスト用フラグを足してログインする */
+async function loginWithFlag(page, target, flag) {
+  await page.goto(target);
+  const authUrl = new URL(page.url());
+  if (flag) {
+    authUrl.searchParams.set(flag, '1');
+  }
+  await page.goto(authUrl.toString());
+  return page.click('button#login-button');
+}
 
-    // The browser should be redirected to the Mock IdP
-    await page.goto(nginxUrl);
+test.describe('NGINX OIDC module (real dynamic module)', () => {
 
-    // 2. Verify we are on the Mock IdP login page
+  test('authenticates and exposes the claims to the backend', async ({ page, context }) => {
+    const target = `${BASE}/protected-resource`;
+
+    // 1. 未認証アクセスは IdP へリダイレクトされる
+    await page.goto(target);
     await expect(page.locator('h1')).toContainText('Mock IdP Login');
 
-    // Check if the URL contains the expected OIDC parameters
     const url = new URL(page.url());
     expect(url.pathname).toBe('/auth');
-    expect(url.searchParams.has('redirect_uri')).toBeTruthy();
-    expect(url.searchParams.has('state')).toBeTruthy();
-    expect(url.searchParams.has('nonce')).toBeTruthy();
-    expect(url.searchParams.has('client_id')).toBeTruthy();
+    expect(url.searchParams.get('response_type')).toBe('code');
+    expect(url.searchParams.get('client_id')).toBe('test-client-id');
+    expect(url.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(url.searchParams.get('code_challenge')).toBeTruthy();
+    expect(url.searchParams.get('state')).toBeTruthy();
+    expect(url.searchParams.get('nonce')).toBeTruthy();
+    expect(url.searchParams.get('redirect_uri')).toBe(`${BASE}/callback`);
 
-    // 3. Fill out the login form
-    await page.fill('input[name="username"]', 'testuser');
-    await page.fill('input[name="password"]', 'password');
-
-    // 4. Submit the form
-    // The Mock IdP will handle the POST, generate a code, and redirect back to NGINX (/callback)
-    // NGINX will exchange the code for tokens, fetch JWKS, verify JWT, set cookie, and redirect to original URL
-    console.log('Submitting login form...');
-
+    // 2. ログイン → コールバック → 元 URL へ戻る
     const [response] = await Promise.all([
-        page.waitForResponse(resp => resp.url() === nginxUrl && resp.status() === 200),
-        page.click('button#login-button')
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      page.click('button#login-button')
     ]);
 
-    // 5. Verify the final response
-    console.log(`Final redirect landed on: ${page.url()}`);
-    expect(page.url()).toBe(nginxUrl);
+    expect(page.url()).toBe(target);
 
-    // Parse the JSON body returned by our mock backend
+    // 3. ID トークン + UserInfo のクレームがバックエンドへ渡っている
     const body = await response.json();
-    console.log('Received claims:', body);
-
-    // Verify the claims were properly extracted from the JWT and passed as headers
     expect(body.sub).toBe('user-123');
     expect(body.email).toBe('testuser@example.com');
     expect(body.name).toBe('Test User');
+    // UserInfo が配列で返す groups がカンマ区切りに展開される
     expect(body.groups).toBe('admin,user');
     expect(body.tenant_id).toBe('tenant-456');
 
-    // 6. Verify subsequent requests work with the session cookie (without full redirect)
-    console.log('Making subsequent request to verify session cookie...');
-    const secondResponse = await page.goto('http://localhost:8080/another-path');
-    expect(secondResponse.status()).toBe(200);
+    // 4. セッション Cookie だけで別パスにもアクセスできる
+    const second = await page.goto(`${BASE}/another-path`);
+    expect(second.status()).toBe(200);
 
-    const secondBody = await secondResponse.json();
+    const secondBody = await second.json();
     expect(secondBody.sub).toBe('user-123');
-    expect(secondBody.groups).toBe('admin,user'); // Ensure extra claims are preserved in the session
-    console.log('Session cookie verified successfully.');
+    expect(secondBody.groups).toBe('admin,user');
+    expect(secondBody.tenant_id).toBe('tenant-456');
+
+    // 5. セッション Cookie の中身
+    const cookies = await context.cookies();
+    const session = cookies.find(c => c.name === 'oidc_auth');
+    expect(session).toBeTruthy();
+
+    if (STORE) {
+      // ストア有効時はセッション ID だけを持つ
+      expect(session.value).toMatch(/^[0-9a-f]{64}$/);
+    } else {
+      // Cookie モードではクレームを載せるが、プロトコルクレームは含めない
+      const payload = decodeURIComponent(session.value).slice(64);
+      const [base, ...extras] = payload.split('|');
+      expect(base.split(':')).toHaveLength(4);
+
+      const keys = extras.map(e =>
+        Buffer.from(e.split(':')[0], 'base64').toString());
+
+      expect(keys).toContain('groups');
+      expect(keys).toContain('tenant_id');
+
+      for (const proto of ['iss', 'aud', 'exp', 'iat', 'nonce', 'azp',
+                           'at_hash', 'jti', 'sub', 'email', 'name']) {
+        expect(keys).not.toContain(proto);
+      }
+    }
   });
+
+  test('rejects a tampered session cookie', async ({ page, context }) => {
+    const target = `${BASE}/protected-resource`;
+
+    await page.goto(target);
+    await page.click('button#login-button');
+    await page.waitForURL(target);
+
+    const cookies = await context.cookies();
+    const session = cookies.find(c => c.name === 'oidc_auth');
+    expect(session).toBeTruthy();
+
+    // 署名部分（先頭 64 文字の HMAC）を書き換える
+    const forged = 'f'.repeat(64) + session.value.slice(64);
+    await context.clearCookies();
+    await context.addCookies([{ ...session, value: forged }]);
+
+    // 署名が合わないので認証済みとして通らず、IdP へ差し戻される
+    await page.goto(target);
+    await expect(page.locator('h1')).toContainText('Mock IdP Login');
+  });
+
+  test('rejects a callback whose state does not match', async ({ request }) => {
+    const resp = await request.get(
+      `${BASE}/callback?code=abc&state=does-not-match`,
+      { maxRedirects: 0 });
+    expect(resp.status()).toBe(403);
+  });
+
+  test('rejects an ID token signed with an unknown key', async ({ page }) => {
+    const target = `${BASE}/protected-resource`;
+
+    await page.goto(target);
+    // モジュールが組み立てた認可 URL に、不正な鍵で署名させるフラグを足す
+    const authUrl = new URL(page.url());
+    authUrl.searchParams.set('bad_sig', '1');
+    await page.goto(authUrl.toString());
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url().startsWith(`${BASE}/callback`)),
+      page.click('button#login-button')
+    ]);
+
+    expect(response.status()).toBe(401);
+  });
+
+  test('rejects an ID token whose aud is another client', async ({ page }) => {
+    const target = `${BASE}/protected-resource`;
+
+    await page.goto(target);
+    const authUrl = new URL(page.url());
+    authUrl.searchParams.set('bad_aud', '1');
+    await page.goto(authUrl.toString());
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url().startsWith(`${BASE}/callback`)),
+      page.click('button#login-button')
+    ]);
+
+    expect(response.status()).toBe(401);
+  });
+
+  test('re-authenticates once the session has expired', async ({ page }) => {
+    const target = `${BASE}/short-session/page`;
+
+    await page.goto(target);
+    await page.click('button#login-button');
+    await page.waitForURL(target);
+
+    // oidc_session_timeout 1s なので、待てば Cookie があっても再認証になる
+    await page.waitForTimeout(2000);
+    await page.goto(target);
+    await expect(page.locator('h1')).toContainText('Mock IdP Login');
+  });
+
+  test('keeps a second location on its own provider', async ({ page }) => {
+    const target = `${BASE}/tenant-b/page`;
+
+    await page.goto(target);
+    await expect(page.locator('h1')).toContainText('Mock IdP Login');
+
+    // ロケーションごとにメタデータを持つので、別ポートの IdP に飛ぶ
+    const url = new URL(page.url());
+    expect(url.port).toBe('3001');
+    expect(url.searchParams.get('client_id')).toBe('tenant-b-client');
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      page.click('button#login-button')
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    // このロケーションは oidc_claims groups なので tenant_id は取り込まれない
+    expect(body.tenant_id).toBe('');
+  });
+
+  test('treats the callback path as an exact match', async ({ request }) => {
+    const resp = await request.get(`${BASE}/callback-not-really`,
+                                   { maxRedirects: 0 });
+    // コールバック扱いではないので、通常の未認証アクセスとして IdP へ飛ばされる
+    expect(resp.status()).toBe(302);
+    expect(resp.headers()['location']).toContain('/auth?');
+  });
+
+  test('adds oidc_auth_request_args to the authorization request', async ({ page }) => {
+    await page.goto(`${BASE}/session/page`);
+
+    const url = new URL(page.url());
+    expect(url.searchParams.get('prompt')).toBe('consent');
+    expect(url.searchParams.get('login_hint')).toBe('testuser@example.com');
+  });
+
+  test('authenticates the client with client_secret_post', async ({ page }) => {
+    const target = `${BASE}/session/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    // モック IdP が使われた認証方式を ID トークンのクレームで返す
+    expect(body.token_auth).toBe('post');
+  });
+
+  test('exposes $oidc_id_token on later requests', async ({ page }) => {
+    test.skip(!STORE, 'the ID token is only kept by the session store');
+
+    const target = `${BASE}/session/page`;
+
+    await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    // セッション Cookie だけのリクエストでも ID トークンが取り出せる
+    const response = await page.goto(`${BASE}/session/other`);
+    const body = await response.json();
+    expect(body.id_token.split('.')).toHaveLength(3);
+  });
+
+  test('renews the tokens with the refresh token', async ({ page }) => {
+    test.skip(!STORE, 'refreshing needs the session store');
+
+    const target = `${BASE}/session/page`;
+
+    // short_token=1 で expires_in=1 のアクセストークンを発行させる
+    const [first] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, 'short_token')
+    ]);
+
+    expect((await first.json()).sub).toBe('user-123');
+
+    await page.waitForTimeout(2000);
+
+    // アクセストークンが期限切れなので、モジュールが裏で更新してから通す
+    const second = await page.goto(target);
+    expect(second.status()).toBe(200);
+
+    const body = await second.json();
+    expect(body.sub).toBe('user-123');
+    // 更新後の ID トークンから復元された名前になっている
+    expect(body.name).toBe('Test User (refreshed)');
+  });
+
+  test('drops the session when introspection reports the token inactive',
+       async ({ page, request }) => {
+    test.skip(!STORE, 'introspection needs the session store');
+
+    const target = `${BASE}/session/page`;
+
+    await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    // IdP 側でアクセストークンを失効させる
+    const revoked = await request.post('http://127.0.0.1:3000/test/revoke');
+    expect(revoked.ok()).toBeTruthy();
+
+    // oidc_introspection_interval 1s なので、待てば次のリクエストで検出される
+    await page.waitForTimeout(1500);
+
+    await page.goto(target);
+    await expect(page.locator('h1')).toContainText('Mock IdP Login');
+  });
+
+  test('performs RP-Initiated Logout', async ({ page, context }) => {
+    const target = `${BASE}/session/page`;
+
+    await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    // /session/logout -> IdP の end_session_endpoint -> post_logout_redirect_uri
+    await page.goto(`${BASE}/session/logout`);
+    await expect(page.locator('body')).toContainText('bye');
+    expect(page.url()).toBe(`${BASE}/bye`);
+
+    const session = (await context.cookies())
+      .find(c => c.name === 'oidc_auth' && c.value !== '');
+    expect(session).toBeFalsy();
+
+    // セッションが消えているので再度ログインを求められる
+    await page.goto(target);
+    await expect(page.locator('h1')).toContainText('Mock IdP Login');
+  });
+
+  test('authenticates the client with client_secret_jwt', async ({ page }) => {
+    const target = `${BASE}/csjwt/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    expect(body.token_auth).toBe('client_secret_jwt');
+  });
+
+  test('authenticates the client with private_key_jwt', async ({ page }) => {
+    const target = `${BASE}/pkjwt/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    expect(body.token_auth).toBe('private_key_jwt');
+  });
+
+  test('uses a named oidc_provider block', async ({ page }) => {
+    const target = `${BASE}/preset/page`;
+
+    await page.goto(target);
+    const url = new URL(page.url());
+    expect(url.searchParams.get('client_id')).toBe('test-client-id');
+    expect(url.searchParams.get('redirect_uri'))
+      .toBe(`${BASE}/preset/callback`);
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      page.click('button#login-button')
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    // userinfo on; がブロックから継承されている
+    expect(body.groups).toBe('admin,user');
+  });
+
+  test('handles back-channel logout', async ({ page, request }) => {
+    test.skip(!STORE, 'back-channel logout needs a session store');
+
+    const target = `${BASE}/session/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const sid = (await response.json()).sid;
+    expect(sid).toBeTruthy();
+
+    const tokenResp = await request.get(
+      `http://127.0.0.1:3000/test/logout_token?sid=${sid}`);
+    const logoutToken = await tokenResp.text();
+
+    const posted = await request.post(`${BASE}/session/backchannel-logout`, {
+      form: { logout_token: logoutToken }
+    });
+    expect(posted.status()).toBe(200);
+
+    // セッションが消えているので再ログインを求められる
+    await page.goto(target);
+    await expect(page.locator('h1')).toContainText('Mock IdP Login');
+  });
+
+  test('rejects a logout token that is not signed by the provider',
+       async ({ request }) => {
+    test.skip(!STORE, 'back-channel logout needs a session store');
+
+    const tokenResp = await request.get(
+      'http://127.0.0.1:3000/test/logout_token?sub=user-123&bad_sig=1');
+
+    const posted = await request.post(`${BASE}/session/backchannel-logout`, {
+      form: { logout_token: await tokenResp.text() }
+    });
+    expect(posted.status()).toBe(400);
+  });
+
+  test('rejects a logout token that carries a nonce', async ({ request }) => {
+    test.skip(!STORE, 'back-channel logout needs a session store');
+
+    const tokenResp = await request.get(
+      'http://127.0.0.1:3000/test/logout_token?sub=user-123&nonce=abc');
+
+    const posted = await request.post(`${BASE}/session/backchannel-logout`, {
+      form: { logout_token: await tokenResp.text() }
+    });
+    expect(posted.status()).toBe(400);
+  });
+
+  test('handles front-channel logout', async ({ page, request }) => {
+    test.skip(!STORE, 'front-channel logout needs a session store');
+
+    const target = `${BASE}/session/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const sid = (await response.json()).sid;
+
+    const iframe = await request.get(
+      `${BASE}/session/frontchannel-logout`
+      + `?iss=${encodeURIComponent('http://127.0.0.1:3000')}&sid=${sid}`);
+    expect(iframe.status()).toBe(200);
+
+    await page.goto(target);
+    await expect(page.locator('h1')).toContainText('Mock IdP Login');
+  });
+
+  test('pushes the authorization request (PAR)', async ({ page }) => {
+    const target = `${BASE}/par/page`;
+
+    await page.goto(target);
+
+    // 事前送信したので、認可 URL には client_id と request_uri しか載らない
+    const url = new URL(page.url());
+    expect(url.searchParams.get('request_uri')).toMatch(/^urn:ietf:params:/);
+    expect(url.searchParams.get('client_id')).toBe('test-client-id');
+    expect(url.searchParams.get('code_challenge')).toBeNull();
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      page.click('button#login-button')
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+  });
+
+  test('binds the tokens to a key with DPoP', async ({ page }) => {
+    const target = `${BASE}/dpop/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    // UserInfo も DPoP で呼べている
+    expect(body.groups).toBe('admin,user');
+
+    // token_type とバックエンド向けの proof はアクセストークンを保持している
+    // 場合だけ得られる（Cookie のみの構成はトークンを残さない）。
+    if (STORE) {
+      // モック IdP は proof を検証したうえで DPoP バインドのトークンを返す
+      expect(body.token_type).toBe('DPoP');
+
+      const [header] = body.dpop_proof.split('.');
+      const decoded = JSON.parse(Buffer.from(header, 'base64url').toString());
+      expect(decoded.typ).toBe('dpop+jwt');
+      expect(decoded.jwk.kty).toBe('EC');
+      expect(decoded.jwk.crv).toBe('P-256');
+    }
+  });
+
+  test('authenticates the client with a certificate (mTLS)', async ({ page }) => {
+    const target = `${BASE}/mtls/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    expect(body.token_auth).toBe('mtls');
+  });
+
 });
