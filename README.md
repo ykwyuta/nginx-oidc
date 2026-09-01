@@ -23,6 +23,10 @@ NGINX Open Source 向けの OpenID Connect (OIDC) 認証ダイナミックモジ
 - **クライアント認証**: `client_secret_basic`（既定）/ `client_secret_post` / `client_secret_jwt` / `private_key_jwt`
 - **Back-Channel / Front-Channel Logout**: IdP からの通知で該当セッションを破棄
 - **`oidc_provider` ブロック**: NGINX Plus 互換の名前付きプロバイダ定義
+- **Pushed Authorization Requests (PAR)**: RFC 9126。認可リクエストをバックチャネルで先に送り、ブラウザには `request_uri` だけを渡す
+- **DPoP**: RFC 9449。EC 鍵で proof を作り、トークン / UserInfo / バックエンドへのリクエストを鍵に紐付ける
+- **mTLS クライアント認証**: RFC 8705。クライアント証明書で認証し、`mtls_endpoint_aliases` のトークン / イントロスペクションエンドポイントがあればそちらを使う
+- **Redis Sentinel / Cluster**: Sentinel でマスターを解決してフェイルオーバーに追従、Cluster では slot 単位のルーティングと MOVED / ASK の追従
 
 ## 依存ライブラリ
 
@@ -211,7 +215,7 @@ http {
 | `oidc_claims <name>...` | http, server, location | — | `$oidc_claim_*` として公開しセッションに保存するクレームを限定 |
 | `oidc_logout_uri <uri>` | http, server, location | — | このパスへのリクエストでログアウトする（RP-Initiated Logout） |
 | `oidc_post_logout_redirect_uri <uri>` | http, server, location | — | ログアウト後の戻り先。IdP に登録が必要 |
-| `oidc_client_auth <method>` | http, server, location | basic | `basic` / `post` / `client_secret_jwt` / `private_key_jwt` |
+| `oidc_client_auth <method>` | http, server, location | basic | `basic` / `post` / `client_secret_jwt` / `private_key_jwt` / `mtls` |
 | `oidc_refresh_token on\|off` | http, server, location | off | アクセストークン失効時にリフレッシュトークンで更新（`oidc_session_store` が必要） |
 | `oidc_introspection on\|off` | http, server, location | off | アクセストークンの失効確認（RFC 7662、`oidc_session_store` が必要） |
 | `oidc_introspection_interval <time>` | http, server, location | `60s` | 同一セッションに対する失効確認の間隔 |
@@ -221,8 +225,15 @@ http {
 | `oidc_client_jwt_key <file>` | http, server, location | — | `private_key_jwt` の署名に使う PEM 秘密鍵 |
 | `oidc_client_jwt_kid <kid>` | http, server, location | — | client assertion の `kid` ヘッダ |
 | `oidc_client_jwt_alg <alg>` | http, server, location | RS256 / HS256 | client assertion の署名アルゴリズム |
+| `oidc_par on\|off` | http, server, location | プロバイダ設定に従う | 認可リクエストを PAR で先に送る（RFC 9126） |
+| `oidc_dpop on\|off` | http, server, location | off | DPoP でトークンを鍵に紐付ける（RFC 9449、`oidc_dpop_key` が必要） |
+| `oidc_dpop_key <file>` | http, server, location | — | proof の署名に使う EC 秘密鍵（P-256 / P-384 / P-521） |
+| `oidc_dpop_htu <value>` | http, server, location | — | `$oidc_dpop_backend_proof` の `htu`（変数使用可） |
 | `oidc_session_store <size\|redis>` | http | — | セッションの保存先。サイズなら共有メモリ（例 `10m`、最小 8 ページ）、`redis` なら Redis |
 | `oidc_redis_pass <addr>` | location | — | Redis の宛先（`/_oidc_redis` ロケーションに書く） |
+| `oidc_redis_sentinel <addr>...` | http | — | Sentinel の宛先。ここからマスターを解決する（`oidc_redis_master` が必要） |
+| `oidc_redis_master <name>` | http | — | Sentinel に問い合わせるマスター名 |
+| `oidc_redis_cluster on\|off` | http | off | Redis Cluster として扱い、slot でルーティングして MOVED / ASK を追う |
 | `oidc_redis_password <pw>` | http, server, location | — | Redis の AUTH パスワード |
 | `oidc_redis_database <n>` | http, server, location | 0 | Redis のデータベース番号 |
 | `oidc_redis_connect_timeout <t>` | http, server, location | `5s` | Redis への接続タイムアウト |
@@ -257,6 +268,40 @@ Redis を使う場合の注意:
 - 応答は 1 回の読み取りで収まる必要があります。ID トークンが大きい IdP では `oidc_redis_buffer_size` を増やしてください。
 - Redis に接続できない場合、セッションは「無効」として扱われ再認証になります（フェイルクローズ）。
 
+#### Redis Sentinel
+
+```nginx
+http {
+    oidc_session_store  redis;
+    oidc_redis_sentinel 127.0.0.1:26379 127.0.0.1:26380 127.0.0.1:26381;
+    oidc_redis_master   mymaster;
+    ...
+    location = /_oidc_redis {
+        internal;
+        # タイムアウトやバッファのためにダミーの宛先が必要（実際の宛先は Sentinel が返す）
+        oidc_redis_pass 127.0.0.1:6379;
+    }
+}
+```
+
+マスターのアドレスは `SENTINEL get-master-addr-by-name` で解決し、ワーカーごとにキャッシュします。コマンドが失敗すると次の Sentinel に問い合わせ直すため、フェイルオーバー後は自動的に新しいマスターへ切り替わります。
+
+#### Redis Cluster
+
+```nginx
+http {
+    oidc_session_store  redis;
+    oidc_redis_cluster  on;
+    ...
+    location = /_oidc_redis {
+        internal;
+        oidc_redis_pass 127.0.0.1:7000;   # 種となるノード
+    }
+}
+```
+
+キーの CRC16 から slot を求めてノードを選び、`MOVED` / `ASK` の応答でスロットマップを学習します（`ASK` の場合は `ASKING` を前置します）。クラスタでは 3 つのキーが別々の slot に落ちるため、`EVAL` の Lua スクリプトではなくキーごとのコマンド（`SETEX` / `SADD` / `EXPIRE`、削除は `SMEMBERS` + `DEL`）に切り替わります。`oidc_redis_cluster` と `oidc_redis_sentinel` は同時に指定できません。
+
 ### 内部ロケーション
 
 本モジュールは非同期サブリクエストで IdP と通信するため、以下の内部ロケーションを定義する必要があります。`proxy_pass` には必ず下表の変数を使ってください（URL の出所を Discovery の結果に限定するための SSRF 対策です）。
@@ -268,6 +313,7 @@ Redis を使う場合の注意:
 | `/_oidc_jwks` | `proxy_pass $oidc_jwks_url;` |
 | `/_oidc_userinfo` | `proxy_pass $oidc_userinfo_url;` + `Authorization: $oidc_userinfo_bearer`（`oidc_use_userinfo on` 時のみ） |
 | `/_oidc_introspect` | `proxy_pass $oidc_introspect_url;` + `proxy_method POST;` + `proxy_set_body $oidc_introspect_body;` + `Authorization: $oidc_token_basic`（`oidc_introspection on` 時のみ） |
+| `/_oidc_par` | `proxy_pass $oidc_par_url;` + `proxy_method POST;` + `proxy_set_body $oidc_par_body;` + `Authorization: $oidc_token_basic`（PAR を使う場合のみ） |
 | `/_oidc_redis` | `oidc_redis_pass <addr>;`（`oidc_session_store redis` 時のみ） |
 
 `/_oidc_token` で `proxy_set_header Content-Length "";` を指定してはいけません。`proxy_set_body` が設定する Content-Length が消え、リクエストボディが IdP に届かなくなります。
@@ -289,9 +335,14 @@ Redis を使う場合の注意:
 | `$oidc_userinfo_url` | UserInfo URL（`/_oidc_userinfo` 用） |
 | `$oidc_token_body` | トークンリクエストのボディ（`proxy_set_body` 用） |
 | `$oidc_token_basic` | `Basic base64(client_id:client_secret)`（`Authorization` ヘッダ用） |
-| `$oidc_userinfo_bearer` | `Bearer <access_token>`（`Authorization` ヘッダ用） |
+| `$oidc_userinfo_bearer` | `Bearer <access_token>`（`oidc_dpop on` のときは `DPoP <access_token>`。`Authorization` ヘッダ用） |
 | `$oidc_introspect_url` | イントロスペクションエンドポイント URL（`/_oidc_introspect` 用） |
 | `$oidc_introspect_body` | イントロスペクションリクエストのボディ（`proxy_set_body` 用） |
+| `$oidc_par_url` | PAR エンドポイント URL（`/_oidc_par` 用） |
+| `$oidc_par_body` | PAR リクエストのボディ（`proxy_set_body` 用） |
+| `$oidc_dpop_proof` | 内部サブリクエスト（トークン / UserInfo）に添える DPoP proof |
+| `$oidc_dpop_backend_proof` | バックエンドへ転送するための DPoP proof。`htu` は `oidc_dpop_htu`、`htm` はリクエストメソッド |
+| `$oidc_token_type` | トークンタイプ（`Bearer` / `DPoP`）。ストアモードでのみ継続リクエストでも参照可能 |
 
 継続アクセス（セッション Cookie 再利用）でも `$oidc_claim_*` はすべて Cookie から復元されます（Cookie ペイロード上限 3500 バイト）。
 
@@ -368,6 +419,7 @@ oidc_frontchannel_logout_uri "https://app.example.com/frontchannel-logout";
 | `post` | ボディに `client_id` と `client_secret` |
 | `client_secret_jwt` | `client_secret` を鍵に HS256 で署名した client assertion（RFC 7523） |
 | `private_key_jwt` | `oidc_client_jwt_key` の秘密鍵で RS256 署名した client assertion |
+| `mtls` | クライアント証明書（RFC 8705 `tls_client_auth` / `self_signed_tls_client_auth`）。ボディには `client_id` だけを載せる |
 
 client assertion の `aud` はトークンエンドポイントの URL、`exp` は 60 秒後、`jti` は毎回ランダムです。アルゴリズムは `oidc_client_jwt_alg` で変更できます（RS/PS/ES/HS の各 256/384/512）。
 
@@ -376,6 +428,65 @@ oidc_client_auth    private_key_jwt;
 oidc_client_jwt_key /etc/nginx/oidc-client.key;   # PEM 秘密鍵
 oidc_client_jwt_kid "my-key-1";                   # 任意
 ```
+
+#### mTLS（RFC 8705）
+
+証明書はモジュールではなく `proxy_ssl_certificate` で送ります。`client_secret` は不要です。
+
+```nginx
+oidc_client_auth mtls;
+
+location = /_oidc_token {
+    internal;
+    proxy_pass                  $oidc_token_url;
+    proxy_method                POST;
+    proxy_set_header            Content-Type "application/x-www-form-urlencoded";
+    proxy_set_body              $oidc_token_body;
+    proxy_ssl_certificate       /etc/nginx/oidc-client.crt;
+    proxy_ssl_certificate_key   /etc/nginx/oidc-client.key;
+    proxy_ssl_trusted_certificate /etc/nginx/idp-ca.crt;
+    proxy_ssl_verify            on;
+    proxy_ssl_server_name       on;
+}
+```
+
+Discovery の `mtls_endpoint_aliases` にトークンエンドポイントやイントロスペクションエンドポイントのエイリアスがある場合は、そちらを使います（RFC 8705 5 章）。
+
+### PAR（RFC 9126）
+
+`oidc_par on` にすると、認可リクエストのパラメータを先にバックチャネルで PAR エンドポイントへ POST し、ブラウザには `client_id` と `request_uri` だけを渡します。`oidc_par` を書かなかった場合は Discovery の `require_pushed_authorization_requests` に従います（`pushed_authorization_request_endpoint` が無ければ通常の認可リクエストにフォールバック）。
+
+```nginx
+oidc_par on;
+
+location = /_oidc_par {
+    internal;
+    proxy_pass       $oidc_par_url;
+    proxy_method     POST;
+    proxy_set_header Content-Type  "application/x-www-form-urlencoded";
+    proxy_set_header Authorization $oidc_token_basic;
+    proxy_set_body   $oidc_par_body;
+}
+```
+
+### DPoP（RFC 9449）
+
+`oidc_dpop on` と `oidc_dpop_key` で、トークンエンドポイントと UserInfo へのリクエストに proof を添えます。トークンが `token_type: DPoP` で返れば `Authorization` も `DPoP <token>` になり、`ath`（アクセストークンのハッシュ）付きの proof を送ります。
+
+```nginx
+oidc_dpop     on;
+oidc_dpop_key /etc/nginx/oidc-dpop.key;           # EC 秘密鍵（P-256 など）
+oidc_dpop_htu "https://api.example.com$uri";      # バックエンド向け proof の htu
+
+location / {
+    auth_oidc on;
+    proxy_pass       http://backend;
+    proxy_set_header Authorization "$oidc_token_type $oidc_access_token";
+    proxy_set_header DPoP          $oidc_dpop_backend_proof;
+}
+```
+
+鍵の JWK（`kty` / `crv` / `x` / `y`）は起動時に秘密鍵から導出し、すべての proof のヘッダに載せます。`jti` は毎回ランダム、`iat` は現在時刻です。バックエンド向けの proof はアクセストークンを保持している必要があるため、`oidc_session_store` が前提になります。
 
 ### 名前付きプロバイダ（`oidc_provider` ブロック）
 
@@ -429,6 +540,9 @@ http {
 - **リフレッシュトークンの保管**: リフレッシュトークンはサーバー側のセッションにのみ保持し、Cookie には出さない
 - **ログアウトトークンの検証**: Back-Channel Logout のトークンは JWKS で署名を検証し、`iss` / `aud` / `iat` / `events` / `nonce` 不在まで確認する
 - **`private_key_jwt`**: `client_secret` を送らずに済むため、シークレットの配布が不要になる
+- **DPoP**: proof は EC 鍵で署名し、`htm` / `htu` / `iat` / `jti` と（アクセストークンがある場合は）`ath` を載せる。秘密鍵はディスク上の PEM のみで、Cookie にもセッションにも出ない
+- **PAR**: 認可パラメータはバックチャネルで送るため、`state` や `code_challenge` がブラウザの履歴やリファラに残らない
+- **mTLS**: `client_secret` を持たずに済む。証明書と鍵は `proxy_ssl_certificate` で NGINX が扱うため、モジュールがメモリ上に保持しない
 - **失効の検知**: `oidc_introspection on` でアクセストークンの失効を検知しセッションを破棄する。イントロスペクションエンドポイントに到達できない場合はセッションを維持し（フェイルオープン）警告ログを出す。タイムスタンプを更新しないため次のリクエストで再試行する
 
 ## テスト
@@ -440,7 +554,7 @@ cd test && npm install && npx playwright install chromium
 NGINX_SRC=/path/to/nginx-1.26.2 ./test/run-e2e.sh
 ```
 
-`run-e2e.sh` はモジュールのビルド、Redis とモック IdP 2 台（RS256 / ES256）の起動、NGINX の起動、Playwright の実行、後片付けまでを行い、**共有メモリ / Redis / Cookie の 3 通り**でテストします（`redis-server` と `openssl` が必要）。詳細は [TEST_PLAYWRIGHT.md](TEST_PLAYWRIGHT.md) を参照してください。
+`run-e2e.sh` はモジュールのビルド、Redis（単体 / Sentinel / 3 ノードクラスタ）とモック IdP 3 台（RS256 / ES256 / mTLS）の起動、NGINX の起動、Playwright の実行、後片付けまでを行い、**共有メモリ / Redis / Redis Sentinel / Redis Cluster / Cookie の 5 通り**でテストします（`redis-server`・`redis-cli`・`openssl` が必要）。詳細は [TEST_PLAYWRIGHT.md](TEST_PLAYWRIGHT.md) を参照してください。
 
 検証シナリオ:
 
@@ -466,6 +580,9 @@ NGINX_SRC=/path/to/nginx-1.26.2 ./test/run-e2e.sh
 20. `oidc_provider` ブロックを参照するロケーション
 21. Back-Channel Logout（署名不正・`nonce` 付きトークンの拒否を含む）
 22. Front-Channel Logout
+23. PAR による認可リクエストの事前送信（`request_uri` でのリダイレクト）
+24. DPoP による鍵バインド（proof の検証・`token_type: DPoP`・バックエンド向け proof）
+25. mTLS でのクライアント認証
 
 ## 実装状況
 
@@ -478,11 +595,13 @@ NGINX_SRC=/path/to/nginx-1.26.2 ./test/run-e2e.sh
 | Phase 5 | UserInfo・任意クレーム永続化・SSRF 対策・実モジュール E2E | 完了 |
 | Phase 6 | サーバーサイドセッション・ログアウト・リフレッシュ・イントロスペクション | 完了 |
 | Phase 7 | Redis セッションストア・Back/Front-Channel Logout・JWT クライアント認証・`oidc_provider` ブロック | 完了 |
+| Phase 8 | PAR・DPoP・mTLS クライアント認証・Redis Sentinel / Cluster | 完了 |
 
-### 未実装の機能
+### 既知の制限
 
-| 機能 | 説明 |
+| 項目 | 内容 |
 |------|------|
-| Redis Sentinel / Cluster | 単一の宛先（または `upstream` ブロック）のみ。フェイルオーバーは NGINX の upstream 機能に依存 |
-| Pushed Authorization Requests (PAR) / DPoP | 認可リクエストの事前送信やトークンの所有証明 |
-| `mTLS` クライアント認証 | `tls_client_auth` / `self_signed_tls_client_auth` |
+| Redis Cluster のスロットマップ | 起動時に `CLUSTER SLOTS` を取得せず、`MOVED` / `ASK` の応答から学習する。最初の数リクエストは 1 往復多くなる |
+| Redis Cluster のノード数 | ワーカーごとに最大 64 ノードまで記憶する |
+| Cookie モードでの DPoP | アクセストークンを保持しないため、継続リクエストでは `$oidc_token_type` と `$oidc_dpop_backend_proof` が空になる |
+| フロントチャネル系の Cookie | `SameSite=Lax` のため、Front-Channel Logout は `sid` クエリでのみセッションを特定する |

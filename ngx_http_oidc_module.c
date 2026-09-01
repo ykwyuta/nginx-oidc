@@ -17,6 +17,11 @@
 #include <openssl/hmac.h>
 #include <openssl/crypto.h>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
+#include <openssl/x509.h>
+#include <openssl/err.h>
 #include <jwt.h>
 
 
@@ -47,6 +52,16 @@
 #define OIDC_REDIS_SAVE           2
 #define OIDC_REDIS_DELETE         3
 #define OIDC_REDIS_PURGE          4
+#define OIDC_REDIS_SENTINEL       5
+
+/* Redis deployment topology. */
+#define OIDC_REDIS_STANDALONE     0
+#define OIDC_REDIS_SENTINEL_MODE  1
+#define OIDC_REDIS_CLUSTER_MODE   2
+
+#define OIDC_CLUSTER_SLOTS        16384
+#define OIDC_CLUSTER_MAX_NODES    64
+#define OIDC_REDIS_MAX_TRIES      4
 
 /* What to do once a Redis operation completes. */
 #define OIDC_AFTER_RESUME         0
@@ -62,6 +77,7 @@
 #define OIDC_CLIENT_AUTH_POST         1
 #define OIDC_CLIENT_AUTH_SECRET_JWT   2
 #define OIDC_CLIENT_AUTH_PRIVATE_JWT  3
+#define OIDC_CLIENT_AUTH_MTLS         4
 
 #define OIDC_ASSERTION_TYPE                                                   \
     "&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3A"                   \
@@ -70,7 +86,7 @@
 /* Maximum age of a back-channel logout token. */
 #define OIDC_LOGOUT_TOKEN_MAX_AGE 300
 
-#define OIDC_SESSION_RECORD_VERSION "1"
+#define OIDC_SESSION_RECORD_VERSION "2"
 
 
 /*
@@ -84,7 +100,20 @@ typedef struct {
     ngx_str_t userinfo_endpoint;       /* optional */
     ngx_str_t end_session_endpoint;    /* optional, RP-Initiated Logout */
     ngx_str_t introspection_endpoint;  /* optional, RFC 7662 */
+    ngx_str_t par_endpoint;            /* optional, RFC 9126 */
+
+    /* mtls_endpoint_aliases, RFC 8705 section 5 */
+    ngx_str_t mtls_token_endpoint;
+    ngx_str_t mtls_introspection_endpoint;
+
+    /* Every field above is an ngx_str_t; ngx_http_oidc_copy_metadata()
+     * relies on that.  Scalars go below. */
+    ngx_uint_t require_par;
 } ngx_http_oidc_provider_metadata_t;
+
+#define OIDC_METADATA_STRINGS                                                 \
+    (offsetof(ngx_http_oidc_provider_metadata_t, require_par)                 \
+     / sizeof(ngx_str_t))
 
 
 /*
@@ -130,6 +159,21 @@ typedef struct {
     ngx_str_t        cookie_secret;
 
     ngx_array_t     *providers;  /* named oidc_provider blocks */
+
+    /* Redis topology (oidc_redis_sentinel / oidc_redis_cluster) */
+    ngx_uint_t       redis_topology;
+    ngx_array_t     *redis_sentinels;   /* ngx_addr_t */
+    ngx_str_t        redis_master_name;
+
+    /* Per worker state, filled in at run time */
+    struct sockaddr_storage  redis_master;
+    socklen_t                redis_master_len;
+    ngx_uint_t               redis_master_valid:1;
+
+    struct sockaddr_storage  cluster_node[OIDC_CLUSTER_MAX_NODES];
+    socklen_t                cluster_node_len[OIDC_CLUSTER_MAX_NODES];
+    ngx_uint_t               cluster_nodes;
+    u_char                  *cluster_slots;   /* OIDC_CLUSTER_SLOTS bytes */
     ngx_uint_t       store;      /* OIDC_STORE_* */
     ngx_shm_zone_t  *shm_zone;   /* oidc_session_store <size>: shared memory */
     ssize_t          shm_size;
@@ -158,6 +202,13 @@ typedef struct {
     ngx_str_t    client_jwt_key;            /* PEM for private_key_jwt */
     ngx_str_t    client_jwt_kid;
     ngx_str_t    client_jwt_alg;
+
+    ngx_flag_t   dpop;                      /* oidc_dpop */
+    ngx_str_t    dpop_key;                  /* PEM private key */
+    ngx_str_t    dpop_jwk;                  /* {"jwk":{...}} header fragment */
+    ngx_str_t    dpop_alg;                  /* ES256 by default */
+    ngx_http_complex_value_t *dpop_htu;     /* htu of the proof sent upstream */
+    ngx_flag_t   par;                       /* oidc_par (unset = follow the IdP) */
     ngx_flag_t   refresh_token;             /* oidc_refresh_token */
     ngx_flag_t   introspection;             /* oidc_introspection */
     time_t       introspection_interval;
@@ -236,7 +287,29 @@ typedef struct {
     time_t     session_issued;        /* when the running session was created */
 
     ngx_str_t  client_assertion;      /* JWT built for the *_jwt auth methods */
-    ngx_str_t  redis_cmd;             /* RESP command to run */
+    ngx_str_t  dpop_proof;            /* proof for the current internal call */
+    ngx_str_t  token_type;            /* token_type of the token response */
+
+    /* authorization request, kept across a PAR round trip */
+    ngx_str_t  auth_state;
+    ngx_str_t  auth_nonce;
+    ngx_str_t  auth_verifier;
+    ngx_str_t  auth_params;
+    ngx_str_t  par_url;
+    ngx_str_t  par_body;
+    ngx_uint_t par_attempted:1;
+    ngx_uint_t par_handled:1;
+
+    ngx_array_t *redis_ops;           /* queued RESP commands */
+    ngx_uint_t redis_pos;
+    ngx_uint_t redis_tries;
+    ngx_uint_t sentinel_index;
+    ngx_uint_t redis_in_sentinel:1;
+    ngx_str_t  purge_key;
+    struct sockaddr *redis_peer;      /* explicit target, NULL = configured */
+    socklen_t  redis_peer_len;
+    ngx_str_t  redis_peer_name;
+    ngx_str_t  redis_cmd;             /* RESP command currently in flight */
     ngx_str_t  redis_value;           /* bulk reply of the last GET */
     ngx_str_t  pending_cookie;        /* cookie to set once the save succeeds */
     ngx_uint_t redis_op;
@@ -292,6 +365,12 @@ static ngx_int_t ngx_http_oidc_validate_logout_token(ngx_http_request_t *r,
     ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx, json_t *payload);
 static ngx_int_t ngx_http_oidc_purge_sessions(ngx_http_request_t *r,
     ngx_http_oidc_ctx_t *ctx, ngx_http_oidc_main_conf_t *mcf);
+static ngx_int_t ngx_http_oidc_client_auth_prepare(ngx_http_request_t *r,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx);
+static size_t ngx_http_oidc_client_auth_len(ngx_http_oidc_loc_conf_t *lcf,
+    ngx_http_oidc_ctx_t *ctx);
+static u_char *ngx_http_oidc_client_auth_append(u_char *p,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx);
 static void *ngx_http_oidc_create_loc_conf(ngx_conf_t *cf);
 
 
@@ -1406,23 +1485,38 @@ ngx_http_oidc_parse_claims(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
  *  Redis client
  *
  *  A minimal RESP client built on the NGINX upstream framework, in the same
- *  spirit as ngx_http_memcached_module.  Only the replies this module needs
- *  are understood: simple strings, integers, bulk strings, nil and errors.
- *  Everything the module asks Redis to do fits in a single command, so a
- *  reply is never an array.
+ *  spirit as ngx_http_memcached_module.  Understood replies: simple strings,
+ *  integers, bulk strings, nil, flat arrays of bulk strings and errors.
+ *
+ *  Three topologies are supported.  Standalone talks to the address of
+ *  oidc_redis_pass.  With oidc_redis_sentinel the master is looked up first
+ *  and cached per worker.  With oidc_redis_cluster the module keeps a slot
+ *  map, follows MOVED and ASK, and issues one command per key instead of the
+ *  multi key Lua scripts.
  * ------------------------------------------------------------------------ */
 
 /* Per-subrequest state of a Redis call. */
 typedef struct {
-    ngx_uint_t  skip;        /* AUTH/SELECT replies still to consume */
-    ngx_str_t   value;       /* bulk reply, copied out of the read buffer */
+    ngx_uint_t  skip;             /* AUTH/SELECT replies still to consume */
+    ngx_str_t   value;            /* bulk reply, copied out of the buffer */
+    ngx_array_t *items;           /* array reply, ngx_str_t */
+    ngx_str_t   error;            /* error reply text */
     ngx_uint_t  found:1;
+    ngx_uint_t  moved:1;          /* MOVED/ASK redirect in `error` */
 } ngx_http_oidc_redis_ctx_t;
+
+
+/* One queued command. */
+typedef struct {
+    ngx_str_t  cmd;               /* serialized RESP */
+    ngx_str_t  key;               /* routing key, empty when it does not matter */
+} ngx_http_oidc_redis_op_t;
 
 
 /*
  * Lua run server side so that a logout only costs one round trip: delete
- * every session listed in the index set, then the set itself.
+ * every session listed in the index set, then the set itself.  Cluster mode
+ * cannot use it because the keys live in different slots.
  */
 static ngx_str_t  ngx_http_oidc_purge_script = ngx_string(
     "local m=redis.call('SMEMBERS',KEYS[1]) "
@@ -1469,6 +1563,142 @@ ngx_http_oidc_resp_cstr(u_char *p, const char *str)
     s.len  = ngx_strlen(str);
 
     return ngx_http_oidc_resp_bulk(p, &s);
+}
+
+
+/* ---- cluster slot arithmetic (CRC16/XMODEM over the hash tag) ---- */
+
+static uint16_t
+ngx_http_oidc_crc16(u_char *data, size_t len)
+{
+    uint16_t  crc = 0;
+    size_t    i;
+    int       j;
+
+    for (i = 0; i < len; i++) {
+        crc ^= (uint16_t) data[i] << 8;
+
+        for (j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? (uint16_t) ((crc << 1) ^ 0x1021)
+                                 : (uint16_t) (crc << 1);
+        }
+    }
+
+    return crc;
+}
+
+
+static ngx_uint_t
+ngx_http_oidc_cluster_slot(ngx_str_t *key)
+{
+    u_char  *open, *close;
+
+    open = ngx_strlchr(key->data, key->data + key->len, '{');
+
+    if (open != NULL) {
+        close = ngx_strlchr(open + 1, key->data + key->len, '}');
+
+        if (close != NULL && close > open + 1) {
+            return ngx_http_oidc_crc16(open + 1, close - open - 1)
+                   % OIDC_CLUSTER_SLOTS;
+        }
+    }
+
+    return ngx_http_oidc_crc16(key->data, key->len) % OIDC_CLUSTER_SLOTS;
+}
+
+
+/*
+ * Remember a cluster node and return its index, or -1 when the table is full.
+ */
+static ngx_int_t
+ngx_http_oidc_cluster_node(ngx_http_oidc_main_conf_t *mcf, struct sockaddr *sa,
+    socklen_t len)
+{
+    ngx_uint_t  i;
+
+    for (i = 0; i < mcf->cluster_nodes; i++) {
+        if (mcf->cluster_node_len[i] == len
+            && ngx_memcmp(&mcf->cluster_node[i], sa, len) == 0)
+        {
+            return (ngx_int_t) i;
+        }
+    }
+
+    if (mcf->cluster_nodes >= OIDC_CLUSTER_MAX_NODES) {
+        return -1;
+    }
+
+    i = mcf->cluster_nodes++;
+    ngx_memcpy(&mcf->cluster_node[i], sa, len);
+    mcf->cluster_node_len[i] = len;
+
+    return (ngx_int_t) i;
+}
+
+
+/*
+ * Point the next call at an explicit address.
+ */
+static void
+ngx_http_oidc_redis_target(ngx_http_oidc_ctx_t *ctx, struct sockaddr *sa,
+    socklen_t len, ngx_str_t *name)
+{
+    ctx->redis_peer     = sa;
+    ctx->redis_peer_len = len;
+
+    if (name != NULL) {
+        ctx->redis_peer_name = *name;
+    }
+}
+
+
+/*
+ * Choose where the command at ctx->redis_pos has to go.
+ */
+static void
+ngx_http_oidc_redis_route(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
+    ngx_http_oidc_main_conf_t *mcf)
+{
+    ngx_http_oidc_redis_op_t  *op;
+    ngx_uint_t                 slot;
+    u_char                     idx;
+
+    ctx->redis_peer = NULL;
+
+    if (mcf->redis_topology == OIDC_REDIS_SENTINEL_MODE) {
+
+        if (mcf->redis_master_valid) {
+            ngx_http_oidc_redis_target(ctx,
+                                   (struct sockaddr *) &mcf->redis_master,
+                                   mcf->redis_master_len, NULL);
+        }
+
+        return;
+    }
+
+    if (mcf->redis_topology != OIDC_REDIS_CLUSTER_MODE
+        || mcf->cluster_slots == NULL
+        || ctx->redis_ops == NULL
+        || ctx->redis_pos >= ctx->redis_ops->nelts)
+    {
+        return;
+    }
+
+    op = (ngx_http_oidc_redis_op_t *) ctx->redis_ops->elts + ctx->redis_pos;
+
+    if (op->key.len == 0) {
+        return;
+    }
+
+    slot = ngx_http_oidc_cluster_slot(&op->key);
+    idx  = mcf->cluster_slots[slot];
+
+    if (idx != 0xff && idx < mcf->cluster_nodes) {
+        ngx_http_oidc_redis_target(ctx,
+                              (struct sockaddr *) &mcf->cluster_node[idx],
+                              mcf->cluster_node_len[idx], NULL);
+    }
 }
 
 
@@ -1557,8 +1787,31 @@ ngx_http_oidc_redis_reinit_request(ngx_http_request_t *r)
     if (rctx != NULL) {
         rctx->skip  = 0;
         rctx->found = 0;
+        rctx->moved = 0;
+        rctx->items = NULL;
         ngx_str_null(&rctx->value);
+        ngx_str_null(&rctx->error);
     }
+
+    return NGX_OK;
+}
+
+
+/*
+ * Read one reply line.  Returns NGX_AGAIN while it is incomplete and, on
+ * success, leaves *end pointing at the CR of the line.
+ */
+static ngx_int_t
+ngx_http_oidc_resp_line(u_char *p, u_char *last, u_char **crlf)
+{
+    u_char  *lf;
+
+    lf = ngx_strlchr(p, last, LF);
+    if (lf == NULL || lf == p || lf[-1] != CR) {
+        return NGX_AGAIN;
+    }
+
+    *crlf = lf - 1;
 
     return NGX_OK;
 }
@@ -1568,9 +1821,8 @@ ngx_http_oidc_redis_reinit_request(ngx_http_request_t *r)
  * Wait until the whole reply is in the read buffer and then hand it over.
  *
  * Returning NGX_AGAIN until the payload is complete keeps the body out of the
- * upstream body machinery entirely: by the time NGX_OK is returned there is
- * nothing left to read, and the value has been copied out of the buffer,
- * which NGINX is free to reset afterwards.
+ * upstream body machinery: by the time NGX_OK is returned the value has been
+ * copied out of the buffer, which NGINX is free to reset afterwards.
  */
 static ngx_int_t
 ngx_http_oidc_redis_process_header(ngx_http_request_t *r)
@@ -1578,23 +1830,23 @@ ngx_http_oidc_redis_process_header(ngx_http_request_t *r)
     ngx_http_upstream_t        *u = r->upstream;
     ngx_http_oidc_redis_ctx_t  *rctx;
     u_char                     *p, *last, *crlf, *start;
-    ngx_int_t                   len;
+    ngx_int_t                   len, count, i;
+    ngx_str_t                  *item;
 
     rctx = ngx_http_get_module_ctx(r, ngx_http_oidc_module);
     if (rctx == NULL) {
         return NGX_ERROR;
     }
 
+    last = u->buffer.last;
+
     for ( ;; ) {
 
-        p    = u->buffer.pos;
-        last = u->buffer.last;
+        p = u->buffer.pos;
 
-        crlf = ngx_strlchr(p, last, LF);
-        if (crlf == NULL || crlf == p || crlf[-1] != CR) {
+        if (ngx_http_oidc_resp_line(p, last, &crlf) != NGX_OK) {
             return NGX_AGAIN;
         }
-        crlf--;                                    /* points at CR */
 
         if (rctx->skip == 0) {
             start = p;
@@ -1647,15 +1899,99 @@ ngx_http_oidc_redis_process_header(ngx_http_request_t *r)
         rctx->value.len = len;
         rctx->found     = 1;
 
-        crlf += 2 + len;                           /* skip payload, land on CR */
+        crlf += 2 + len;                           /* land on the closing CR */
 
         u->headers_in.status_n = NGX_HTTP_OK;
         break;
 
+    case '*':                                      /* array of bulk strings */
+
+        count = ngx_atoi(p + 1, crlf - (p + 1));
+        if (count == NGX_ERROR) {
+            if (crlf - p == 3 && p[1] == '-' && p[2] == '1') {
+                u->headers_in.status_n = NGX_HTTP_NOT_FOUND;
+                break;
+            }
+            return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+        }
+
+        rctx->items = ngx_array_create(r->pool, count ? count : 1,
+                                       sizeof(ngx_str_t));
+        if (rctx->items == NULL) {
+            return NGX_ERROR;
+        }
+
+        p = crlf + 2;
+
+        for (i = 0; i < count; i++) {
+
+            if (ngx_http_oidc_resp_line(p, last, &crlf) != NGX_OK) {
+                return NGX_AGAIN;
+            }
+
+            if (*p != '$') {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "OIDC: unsupported redis array element");
+                return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+            }
+
+            item = ngx_array_push(rctx->items);
+            if (item == NULL) {
+                return NGX_ERROR;
+            }
+            ngx_str_null(item);
+
+            if (crlf - p == 3 && p[1] == '-' && p[2] == '1') {
+                p = crlf + 2;
+                continue;
+            }
+
+            len = ngx_atoi(p + 1, crlf - (p + 1));
+            if (len == NGX_ERROR || len < 0) {
+                return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+            }
+
+            if (last - (crlf + 2) < len + 2) {
+                return NGX_AGAIN;
+            }
+
+            item->data = ngx_pnalloc(r->pool, len);
+            if (item->data == NULL) {
+                return NGX_ERROR;
+            }
+
+            ngx_memcpy(item->data, crlf + 2, len);
+            item->len = len;
+
+            p = crlf + 2 + len + 2;
+        }
+
+        crlf = p - 2;
+        rctx->found = 1;
+        u->headers_in.status_n = NGX_HTTP_OK;
+        break;
+
     case '-':                                      /* error */
+
+        rctx->error.data = ngx_pnalloc(r->pool, crlf - p);
+        if (rctx->error.data == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_memcpy(rctx->error.data, p + 1, crlf - p - 1);
+        rctx->error.len = crlf - p - 1;
+
+        if (rctx->error.len > 6
+            && (ngx_strncmp(rctx->error.data, "MOVED ", 6) == 0
+                || ngx_strncmp(rctx->error.data, "ASK ", 4) == 0))
+        {
+            /* A redirect is handled by the caller, not an error. */
+            rctx->moved = 1;
+            u->headers_in.status_n = NGX_HTTP_OK;
+            break;
+        }
+
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "OIDC: redis returned an error: \"%*s\"",
-                      (size_t) (crlf - p), p);
+                      "OIDC: redis returned an error: \"%V\"", &rctx->error);
         return NGX_HTTP_UPSTREAM_INVALID_HEADER;
 
     default:
@@ -1667,11 +2003,9 @@ ngx_http_oidc_redis_process_header(ngx_http_request_t *r)
     /*
      * The reply has been copied already, but it is still handed to NGINX as
      * the response body: an upstream response of length zero would leave the
-     * non-buffered machinery waiting for data that never comes, and the
-     * subrequest would only end on the read timeout.
+     * non-buffered machinery waiting for data that never comes.
      */
     u->headers_in.content_length_n = (crlf + 2) - start;
-    u->length                      = (ssize_t) u->headers_in.content_length_n;
     u->state->status               = u->headers_in.status_n;
 
     return NGX_OK;
@@ -1733,6 +2067,7 @@ ngx_http_oidc_redis_handler(ngx_http_request_t *r)
 {
     ngx_http_oidc_loc_conf_t   *lcf;
     ngx_http_oidc_redis_ctx_t  *rctx;
+    ngx_http_oidc_ctx_t        *ctx;
     ngx_http_upstream_t        *u;
 
     if (ngx_http_upstream_create(r) != NGX_OK) {
@@ -1751,12 +2086,38 @@ ngx_http_oidc_redis_handler(ngx_http_request_t *r)
     ngx_http_set_ctx(r, rctx, ngx_http_oidc_module);
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_oidc_module);
+    ctx = ngx_http_get_module_ctx(r->main, ngx_http_oidc_module);
 
     u = r->upstream;
 
     ngx_str_set(&u->schema, "redis://");
     u->output.tag = (ngx_buf_tag_t) &ngx_http_oidc_module;
     u->conf       = &lcf->redis_upstream;
+
+    /*
+     * With sentinel or cluster the address is picked per call, so the
+     * configured upstream is bypassed the same way proxy_pass with a variable
+     * does it.
+     */
+    if (ctx != NULL && ctx->redis_peer != NULL) {
+
+        u->resolved = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_resolved_t));
+        if (u->resolved == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        u->resolved->sockaddr = ctx->redis_peer;
+        u->resolved->socklen  = ctx->redis_peer_len;
+        u->resolved->naddrs   = 1;
+        u->resolved->host     = ctx->redis_peer_name;
+        u->resolved->port     = ngx_inet_get_port(ctx->redis_peer);
+        u->resolved->no_port  = 0;
+
+    } else if (lcf->redis_upstream.upstream == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: no redis address is configured");
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     u->input_filter_init = ngx_http_oidc_redis_filter_init;
     u->input_filter      = ngx_http_oidc_redis_filter;
@@ -1779,7 +2140,8 @@ ngx_http_oidc_redis_handler(ngx_http_request_t *r)
 /* ------------------------------------------------------------------------ *
  *  Session record (used by the Redis store)
  *
- *   1|issued|access_expires|introspected|B64(id)|B64(at)|B64(rt)|B64(sid)|claims
+ *   2|issued|access_expires|introspected|B64(id)|B64(at)|B64(rt)|B64(sid)|
+ *     B64(token_type)|claims
  *
  *  The claims block is last because it contains '|' itself.
  * ------------------------------------------------------------------------ */
@@ -1803,21 +2165,22 @@ static ngx_int_t
 ngx_http_oidc_build_record(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
     ngx_str_t *claims, time_t issued, ngx_str_t *out)
 {
-    ngx_str_t  id64, at64, rt64, sid64;
+    ngx_str_t  id64, at64, rt64, sid64, tt64;
     u_char    *p;
     size_t     len;
 
     if (ngx_http_oidc_b64_field(r->pool, &ctx->id_token, &id64) != NGX_OK
         || ngx_http_oidc_b64_field(r->pool, &ctx->access_token, &at64) != NGX_OK
         || ngx_http_oidc_b64_field(r->pool, &ctx->refresh_token, &rt64) != NGX_OK
-        || ngx_http_oidc_b64_field(r->pool, &ctx->oidc_sid, &sid64) != NGX_OK)
+        || ngx_http_oidc_b64_field(r->pool, &ctx->oidc_sid, &sid64) != NGX_OK
+        || ngx_http_oidc_b64_field(r->pool, &ctx->token_type, &tt64) != NGX_OK)
     {
         return NGX_ERROR;
     }
 
-    len = sizeof(OIDC_SESSION_RECORD_VERSION) - 1 + 8
+    len = sizeof(OIDC_SESSION_RECORD_VERSION) - 1 + 9
         + 3 * NGX_TIME_T_LEN
-        + id64.len + at64.len + rt64.len + sid64.len + claims->len;
+        + id64.len + at64.len + rt64.len + sid64.len + tt64.len + claims->len;
 
     out->data = ngx_pnalloc(r->pool, len);
     if (out->data == NULL) {
@@ -1825,9 +2188,9 @@ ngx_http_oidc_build_record(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
     }
 
     p = ngx_snprintf(out->data, len,
-                     OIDC_SESSION_RECORD_VERSION "|%T|%T|%T|%V|%V|%V|%V|%V",
+                     OIDC_SESSION_RECORD_VERSION "|%T|%T|%T|%V|%V|%V|%V|%V|%V",
                      issued, ctx->access_expires, ctx->introspected,
-                     &id64, &at64, &rt64, &sid64, claims);
+                     &id64, &at64, &rt64, &sid64, &tt64, claims);
 
     out->len = p - out->data;
 
@@ -1925,7 +2288,8 @@ ngx_http_oidc_parse_record(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
     if (ngx_http_oidc_record_b64(r, &p, end, &ctx->id_token) != NGX_OK
         || ngx_http_oidc_record_b64(r, &p, end, &ctx->access_token) != NGX_OK
         || ngx_http_oidc_record_b64(r, &p, end, &ctx->refresh_token) != NGX_OK
-        || ngx_http_oidc_record_b64(r, &p, end, &ctx->oidc_sid) != NGX_OK)
+        || ngx_http_oidc_record_b64(r, &p, end, &ctx->oidc_sid) != NGX_OK
+        || ngx_http_oidc_record_b64(r, &p, end, &ctx->token_type) != NGX_OK)
     {
         return NGX_ERROR;
     }
@@ -1943,56 +2307,163 @@ ngx_http_oidc_parse_record(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
 
 static ngx_int_t ngx_http_oidc_redis_done(ngx_http_request_t *r, void *data,
     ngx_int_t rc);
+static ngx_int_t ngx_http_oidc_redis_next(ngx_http_request_t *r,
+    ngx_http_oidc_ctx_t *ctx);
 
 
 /*
- * Serialise a RESP command and start the /_oidc_redis subrequest.
+ * Serialise a command and append it to the queue of the current operation.
+ * `key` is the key the command acts on; cluster mode routes by it.
  */
 static ngx_int_t
-ngx_http_oidc_redis_call(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
-    ngx_str_t *args, ngx_uint_t nargs, ngx_uint_t op, ngx_uint_t after)
+ngx_http_oidc_redis_push(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
+    ngx_str_t *args, ngx_uint_t nargs, ngx_str_t *key)
 {
-    ngx_http_request_t          *sr;
-    ngx_http_post_subrequest_t  *psr;
-    ngx_str_t                    uri = ngx_string("/_oidc_redis");
-    u_char                      *p;
-    size_t                       len;
-    ngx_uint_t                   i;
+    ngx_http_oidc_redis_op_t  *op;
+    u_char                    *p;
+    size_t                     len;
+    ngx_uint_t                 i;
+
+    if (ctx->redis_ops == NULL) {
+        ctx->redis_ops = ngx_array_create(r->pool, 8,
+                                          sizeof(ngx_http_oidc_redis_op_t));
+        if (ctx->redis_ops == NULL) {
+            return NGX_ERROR;
+        }
+    }
 
     len = 1 + NGX_INT_T_LEN + 2;
     for (i = 0; i < nargs; i++) {
         len += ngx_http_oidc_resp_len(args[i].len);
     }
 
-    ctx->redis_cmd.data = ngx_pnalloc(r->pool, len);
-    if (ctx->redis_cmd.data == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    op = ngx_array_push(ctx->redis_ops);
+    if (op == NULL) {
+        return NGX_ERROR;
     }
 
-    p = ngx_sprintf(ctx->redis_cmd.data, "*%ui" CRLF, nargs);
+    op->cmd.data = ngx_pnalloc(r->pool, len);
+    if (op->cmd.data == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_sprintf(op->cmd.data, "*%ui" CRLF, nargs);
     for (i = 0; i < nargs; i++) {
         p = ngx_http_oidc_resp_bulk(p, &args[i]);
     }
 
-    ctx->redis_cmd.len = p - ctx->redis_cmd.data;
+    op->cmd.len = p - op->cmd.data;
+    op->key     = key ? *key : (ngx_str_t) ngx_null_string;
+
+    return NGX_OK;
+}
+
+
+/*
+ * Run the queued commands.
+ */
+static ngx_int_t
+ngx_http_oidc_redis_run(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
+    ngx_uint_t op, ngx_uint_t after)
+{
+    ctx->redis_op      = op;
+    ctx->redis_after   = after;
+    ctx->redis_pos     = 0;
+    ctx->redis_tries   = 0;
+    ctx->redis_peer    = NULL;
+
+    return ngx_http_oidc_redis_next(r, ctx);
+}
+
+
+/*
+ * Issue the next command, asking a sentinel for the master first when the
+ * address is not known yet.
+ */
+static ngx_int_t
+ngx_http_oidc_redis_next(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx)
+{
+    ngx_http_request_t          *sr;
+    ngx_http_post_subrequest_t  *psr;
+    ngx_http_oidc_main_conf_t   *mcf;
+    ngx_http_oidc_redis_op_t    *ops;
+    ngx_str_t                    uri = ngx_string("/_oidc_redis");
+    ngx_str_t                    args[3];
+    ngx_addr_t                  *sentinel;
+    u_char                      *p;
+    size_t                       len;
+
+    mcf = ngx_http_get_module_main_conf(r, ngx_http_oidc_module);
+
+    ctx->redis_in_sentinel = 0;
+
+    if (mcf->redis_topology == OIDC_REDIS_SENTINEL_MODE
+        && !mcf->redis_master_valid)
+    {
+        if (mcf->redis_sentinels == NULL
+            || ctx->sentinel_index >= mcf->redis_sentinels->nelts)
+        {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "OIDC: no sentinel could name the redis master");
+            return NGX_ERROR;
+        }
+
+        sentinel = (ngx_addr_t *) mcf->redis_sentinels->elts
+                   + ctx->sentinel_index;
+
+        ngx_str_set(&args[0], "SENTINEL");
+        ngx_str_set(&args[1], "get-master-addr-by-name");
+        args[2] = mcf->redis_master_name;
+
+        len = 1 + NGX_INT_T_LEN + 2
+            + ngx_http_oidc_resp_len(args[0].len)
+            + ngx_http_oidc_resp_len(args[1].len)
+            + ngx_http_oidc_resp_len(args[2].len);
+
+        ctx->redis_cmd.data = ngx_pnalloc(r->pool, len);
+        if (ctx->redis_cmd.data == NULL) {
+            return NGX_ERROR;
+        }
+
+        p = ngx_cpymem(ctx->redis_cmd.data, "*3" CRLF, sizeof("*3" CRLF) - 1);
+        p = ngx_http_oidc_resp_bulk(p, &args[0]);
+        p = ngx_http_oidc_resp_bulk(p, &args[1]);
+        p = ngx_http_oidc_resp_bulk(p, &args[2]);
+        ctx->redis_cmd.len = p - ctx->redis_cmd.data;
+
+        ngx_http_oidc_redis_target(ctx, sentinel->sockaddr, sentinel->socklen,
+                                   &sentinel->name);
+        ctx->redis_in_sentinel = 1;
+
+    } else {
+
+        if (ctx->redis_ops == NULL || ctx->redis_pos >= ctx->redis_ops->nelts) {
+            return NGX_ERROR;
+        }
+
+        ops = ctx->redis_ops->elts;
+        ctx->redis_cmd = ops[ctx->redis_pos].cmd;
+
+        if (ctx->redis_peer == NULL) {
+            ngx_http_oidc_redis_route(r, ctx, mcf);
+        }
+    }
 
     psr = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
     if (psr == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return NGX_ERROR;
     }
 
     psr->handler = ngx_http_oidc_redis_done;
     psr->data    = NULL;
 
-    ctx->redis_op      = op;
-    ctx->redis_after   = after;
     ctx->redis_handled = 0;
     ngx_str_null(&ctx->redis_value);
 
     if (ngx_http_subrequest(r, &uri, NULL, &sr, psr,
                             NGX_HTTP_SUBREQUEST_IN_MEMORY) != NGX_OK)
     {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return NGX_ERROR;
     }
 
     ctx->waiting = 1;
@@ -2028,11 +2499,16 @@ ngx_http_oidc_redis_load(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx)
     ngx_http_oidc_redis_key(r, "oidc:s:", &ctx->sid, &args[1]);
 
     if (args[1].len == 0) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return NGX_ERROR;
     }
 
-    return ngx_http_oidc_redis_call(r, ctx, args, 2, OIDC_REDIS_LOAD,
-                                    OIDC_AFTER_RESUME);
+    ctx->redis_ops = NULL;
+
+    if (ngx_http_oidc_redis_push(r, ctx, args, 2, &args[1]) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return ngx_http_oidc_redis_run(r, ctx, OIDC_REDIS_LOAD, OIDC_AFTER_RESUME);
 }
 
 
@@ -2040,29 +2516,97 @@ static ngx_int_t
 ngx_http_oidc_redis_save(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
     ngx_str_t *record, time_t ttl, ngx_uint_t after)
 {
-    ngx_str_t  args[11];
-    u_char     ttl_buf[NGX_TIME_T_LEN];
+    ngx_http_oidc_main_conf_t  *mcf;
+    ngx_str_t                   args[11];
+    ngx_str_t                   skey, sidkey, subkey, ttlstr;
+    u_char                      ttl_buf[NGX_TIME_T_LEN];
 
-    ngx_str_set(&args[0], "EVAL");
-    args[1] = ngx_http_oidc_save_script;
-    ngx_str_set(&args[2], "3");
+    mcf = ngx_http_get_module_main_conf(r, ngx_http_oidc_module);
 
-    ngx_http_oidc_redis_key(r, "oidc:s:", &ctx->sid, &args[3]);
-    ngx_http_oidc_redis_key(r, "oidc:x:sid:", &ctx->oidc_sid, &args[4]);
-    ngx_http_oidc_redis_key(r, "oidc:x:sub:", &ctx->claims.sub, &args[5]);
+    ngx_http_oidc_redis_key(r, "oidc:s:", &ctx->sid, &skey);
+    ngx_http_oidc_redis_key(r, "oidc:x:sid:", &ctx->oidc_sid, &sidkey);
+    ngx_http_oidc_redis_key(r, "oidc:x:sub:", &ctx->claims.sub, &subkey);
 
-    if (args[3].len == 0 || args[4].len == 0 || args[5].len == 0) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    if (skey.len == 0 || sidkey.len == 0 || subkey.len == 0) {
+        return NGX_ERROR;
     }
 
-    args[6].data = ttl_buf;
-    args[6].len  = ngx_sprintf(ttl_buf, "%T", ttl) - ttl_buf;
-    args[7]      = *record;
-    args[8]      = ctx->sid;
-    args[9]      = ctx->oidc_sid;
-    args[10]     = ctx->claims.sub;
+    ttlstr.data = ttl_buf;
+    ttlstr.len  = ngx_sprintf(ttl_buf, "%T", ttl) - ttl_buf;
 
-    return ngx_http_oidc_redis_call(r, ctx, args, 11, OIDC_REDIS_SAVE, after);
+    ctx->redis_ops = NULL;
+
+    if (mcf->redis_topology != OIDC_REDIS_CLUSTER_MODE) {
+
+        ngx_str_set(&args[0], "EVAL");
+        args[1] = ngx_http_oidc_save_script;
+        ngx_str_set(&args[2], "3");
+        args[3]  = skey;
+        args[4]  = sidkey;
+        args[5]  = subkey;
+        args[6]  = ttlstr;
+        args[7]  = *record;
+        args[8]  = ctx->sid;
+        args[9]  = ctx->oidc_sid;
+        args[10] = ctx->claims.sub;
+
+        if (ngx_http_oidc_redis_push(r, ctx, args, 11, &skey) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return ngx_http_oidc_redis_run(r, ctx, OIDC_REDIS_SAVE, after);
+    }
+
+    /*
+     * In a cluster the three keys live in different slots, so the script is
+     * replaced by one command per key.
+     */
+    ngx_str_set(&args[0], "SETEX");
+    args[1] = skey;
+    args[2] = ttlstr;
+    args[3] = *record;
+
+    if (ngx_http_oidc_redis_push(r, ctx, args, 4, &skey) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (ctx->oidc_sid.len) {
+        ngx_str_set(&args[0], "SADD");
+        args[1] = sidkey;
+        args[2] = ctx->sid;
+
+        if (ngx_http_oidc_redis_push(r, ctx, args, 3, &sidkey) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        ngx_str_set(&args[0], "EXPIRE");
+        args[1] = sidkey;
+        args[2] = ttlstr;
+
+        if (ngx_http_oidc_redis_push(r, ctx, args, 3, &sidkey) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    if (ctx->claims.sub.len) {
+        ngx_str_set(&args[0], "SADD");
+        args[1] = subkey;
+        args[2] = ctx->sid;
+
+        if (ngx_http_oidc_redis_push(r, ctx, args, 3, &subkey) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        ngx_str_set(&args[0], "EXPIRE");
+        args[1] = subkey;
+        args[2] = ttlstr;
+
+        if (ngx_http_oidc_redis_push(r, ctx, args, 3, &subkey) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    return ngx_http_oidc_redis_run(r, ctx, OIDC_REDIS_SAVE, after);
 }
 
 
@@ -2076,29 +2620,121 @@ ngx_http_oidc_redis_delete(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
     ngx_http_oidc_redis_key(r, "oidc:s:", &ctx->sid, &args[1]);
 
     if (args[1].len == 0) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return NGX_ERROR;
     }
 
-    return ngx_http_oidc_redis_call(r, ctx, args, 2, OIDC_REDIS_DELETE, after);
+    ctx->redis_ops = NULL;
+
+    if (ngx_http_oidc_redis_push(r, ctx, args, 2, &args[1]) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return ngx_http_oidc_redis_run(r, ctx, OIDC_REDIS_DELETE, after);
 }
 
 
 /*
- * Delete every session indexed under `key` (back-channel / front-channel
- * logout).  A Lua script keeps it to a single round trip.
+ * Delete every session indexed under `index_key` (back-channel / front-channel
+ * logout).  Outside a cluster a Lua script keeps it to a single round trip; in
+ * a cluster the members are read first and deleted one by one.
  */
 static ngx_int_t
 ngx_http_oidc_redis_purge(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
     ngx_str_t *index_key, ngx_uint_t after)
 {
-    ngx_str_t  args[4];
+    ngx_http_oidc_main_conf_t  *mcf;
+    ngx_str_t                   args[4];
 
-    ngx_str_set(&args[0], "EVAL");
-    args[1] = ngx_http_oidc_purge_script;
-    ngx_str_set(&args[2], "1");
-    args[3] = *index_key;
+    mcf = ngx_http_get_module_main_conf(r, ngx_http_oidc_module);
 
-    return ngx_http_oidc_redis_call(r, ctx, args, 4, OIDC_REDIS_PURGE, after);
+    ctx->redis_ops = NULL;
+
+    if (mcf->redis_topology != OIDC_REDIS_CLUSTER_MODE) {
+
+        ngx_str_set(&args[0], "EVAL");
+        args[1] = ngx_http_oidc_purge_script;
+        ngx_str_set(&args[2], "1");
+        args[3] = *index_key;
+
+        if (ngx_http_oidc_redis_push(r, ctx, args, 4, index_key) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+    } else {
+
+        ngx_str_set(&args[0], "SMEMBERS");
+        args[1] = *index_key;
+
+        if (ngx_http_oidc_redis_push(r, ctx, args, 2, index_key) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        ctx->purge_key = *index_key;
+    }
+
+    return ngx_http_oidc_redis_run(r, ctx, OIDC_REDIS_PURGE, after);
+}
+
+
+/*
+ * "MOVED 3999 127.0.0.1:7002" / "ASK 3999 127.0.0.1:7002"
+ */
+static ngx_int_t
+ngx_http_oidc_redis_redirect(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
+    ngx_http_oidc_main_conf_t *mcf, ngx_str_t *error)
+{
+    ngx_url_t   u;
+    ngx_str_t   addr;
+    u_char     *p, *end, *sp;
+    ngx_int_t   slot, node;
+    ngx_uint_t  moved;
+
+    moved = (error->len > 6 && ngx_strncmp(error->data, "MOVED ", 6) == 0);
+
+    p   = error->data + (moved ? 6 : 4);
+    end = error->data + error->len;
+
+    sp = ngx_strlchr(p, end, ' ');
+    if (sp == NULL) {
+        return NGX_ERROR;
+    }
+
+    slot = ngx_atoi(p, sp - p);
+    if (slot == NGX_ERROR || slot < 0 || slot >= OIDC_CLUSTER_SLOTS) {
+        return NGX_ERROR;
+    }
+
+    addr.data = sp + 1;
+    addr.len  = end - (sp + 1);
+
+    ngx_memzero(&u, sizeof(ngx_url_t));
+    u.url        = addr;
+    u.no_resolve = 1;
+
+    if (ngx_parse_url(r->pool, &u) != NGX_OK || u.naddrs == 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: cannot parse the redis redirect \"%V\"", &addr);
+        return NGX_ERROR;
+    }
+
+    node = ngx_http_oidc_cluster_node(mcf, u.addrs[0].sockaddr,
+                                      u.addrs[0].socklen);
+    if (node < 0) {
+        return NGX_ERROR;
+    }
+
+    if (moved && mcf->cluster_slots != NULL) {
+        mcf->cluster_slots[slot] = (u_char) node;
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "OIDC: redis slot %i moved to \"%V\"", slot, &addr);
+
+    ngx_http_oidc_redis_target(ctx,
+                          (struct sockaddr *) &mcf->cluster_node[node],
+                          mcf->cluster_node_len[node], &addr);
+
+    return NGX_OK;
 }
 
 
@@ -2570,8 +3206,43 @@ ngx_http_oidc_parse_discovery_json(ngx_http_request_t *r, ngx_pool_t *pool,
     OIDC_DISCOVERY_FIELD(userinfo_endpoint,     "userinfo_endpoint",      0)
     OIDC_DISCOVERY_FIELD(end_session_endpoint,  "end_session_endpoint",   0)
     OIDC_DISCOVERY_FIELD(introspection_endpoint, "introspection_endpoint", 0)
+    OIDC_DISCOVERY_FIELD(par_endpoint,
+                         "pushed_authorization_request_endpoint",           0)
 
 #undef OIDC_DISCOVERY_FIELD
+
+    v = json_object_get(root, "require_pushed_authorization_requests");
+    metadata->require_par = json_is_true(v) ? 1 : 0;
+
+    /* RFC 8705 section 5: separate endpoints for mTLS client authentication */
+    {
+        json_t  *aliases = json_object_get(root, "mtls_endpoint_aliases");
+        json_t  *alias;
+
+        if (json_is_object(aliases)) {
+
+            alias = json_object_get(aliases, "token_endpoint");
+            if (json_is_string(alias)
+                && ngx_http_oidc_str_copy(pool, &metadata->mtls_token_endpoint,
+                                          json_string_value(alias),
+                                          ngx_strlen(json_string_value(alias)))
+                   != NGX_OK)
+            {
+                goto done;
+            }
+
+            alias = json_object_get(aliases, "introspection_endpoint");
+            if (json_is_string(alias)
+                && ngx_http_oidc_str_copy(pool,
+                                          &metadata->mtls_introspection_endpoint,
+                                          json_string_value(alias),
+                                          ngx_strlen(json_string_value(alias)))
+                   != NGX_OK)
+            {
+                goto done;
+            }
+        }
+    }
 
     rc = NGX_OK;
 
@@ -2815,26 +3486,296 @@ ngx_http_oidc_random_hex(u_char *dst, size_t bytes)
 }
 
 
+/* ------------------------------------------------------------------------ *
+ *  DPoP (RFC 9449)
+ * ------------------------------------------------------------------------ */
+
 /*
- * Build the authorization request and redirect the browser to the IdP.
+ * Derive the public JWK of an EC private key.
+ *
+ * The uncompressed point sits at the end of the DER SubjectPublicKeyInfo, so
+ * it can be taken from there instead of going through the low level EC API,
+ * which differs between OpenSSL 1.1 and 3.x.
  */
 static ngx_int_t
-ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
+ngx_http_oidc_dpop_jwk(ngx_conf_t *cf, ngx_str_t *pem, ngx_str_t *jwk,
+    ngx_str_t *alg)
+{
+    BIO         *bio;
+    EVP_PKEY    *pkey;
+    u_char      *der = NULL, *point;
+    u_char      *x64, *y64;
+    const char  *crv;
+    int          der_len, bits;
+    size_t       coord;
+    ngx_int_t    rc = NGX_ERROR;
+
+    bio = BIO_new_mem_buf(pem->data, (int) pem->len);
+    if (bio == NULL) {
+        return NGX_ERROR;
+    }
+
+    pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+
+    if (pkey == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "oidc_dpop_key is not a readable private key");
+        return NGX_ERROR;
+    }
+
+    if (EVP_PKEY_base_id(pkey) != EVP_PKEY_EC) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "oidc_dpop_key must be an EC key");
+        goto done;
+    }
+
+    bits = EVP_PKEY_bits(pkey);
+
+    switch (bits) {
+    case 256: crv = "P-256"; coord = 32; ngx_str_set(alg, "ES256"); break;
+    case 384: crv = "P-384"; coord = 48; ngx_str_set(alg, "ES384"); break;
+    case 521: crv = "P-521"; coord = 66; ngx_str_set(alg, "ES512"); break;
+    default:
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "oidc_dpop_key uses an unsupported curve");
+        goto done;
+    }
+
+    der_len = i2d_PUBKEY(pkey, &der);
+    if (der_len < (int) (1 + 2 * coord)) {
+        goto done;
+    }
+
+    point = der + der_len - (1 + 2 * coord);
+    if (*point != 0x04) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "oidc_dpop_key has an unexpected public point");
+        goto done;
+    }
+    point++;
+
+    x64 = ngx_pnalloc(cf->pool, ngx_base64_encoded_length(coord) + 1);
+    y64 = ngx_pnalloc(cf->pool, ngx_base64_encoded_length(coord) + 1);
+    if (x64 == NULL || y64 == NULL) {
+        goto done;
+    }
+
+    {
+        ngx_str_t  src, dst;
+
+        src.data = point;      src.len = coord;
+        dst.data = x64;
+        ngx_encode_base64url(&dst, &src);
+        dst.data[dst.len] = '\0';
+
+        src.data = point + coord;
+        dst.data = y64;
+        ngx_encode_base64url(&dst, &src);
+        dst.data[dst.len] = '\0';
+    }
+
+    jwk->data = ngx_pnalloc(cf->pool,
+                            sizeof("{\"jwk\":{\"kty\":\"EC\",\"crv\":\"\","
+                                   "\"x\":\"\",\"y\":\"\"}}")
+                            + ngx_strlen(crv)
+                            + ngx_strlen(x64) + ngx_strlen(y64));
+    if (jwk->data == NULL) {
+        goto done;
+    }
+
+    jwk->len = ngx_sprintf(jwk->data,
+                           "{\"jwk\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                           "\"x\":\"%s\",\"y\":\"%s\"}}%Z",
+                           crv, x64, y64)
+               - jwk->data - 1;
+
+    rc = NGX_OK;
+
+done:
+
+    OPENSSL_free(der);
+    EVP_PKEY_free(pkey);
+
+    return rc;
+}
+
+
+/*
+ * Build a DPoP proof for one request.  `token` is the access token the proof
+ * is bound to, or an empty string when there is none yet (the token request
+ * itself).
+ */
+static ngx_int_t
+ngx_http_oidc_dpop_build(ngx_http_request_t *r, ngx_http_oidc_loc_conf_t *lcf,
+    ngx_str_t *htm, ngx_str_t *htu, ngx_str_t *token, ngx_str_t *out)
+{
+    jwt_t      *jwt = NULL;
+    jwt_alg_t   alg;
+    char       *encoded;
+    u_char      jti[65];
+    u_char      digest[32];
+    u_char      ath[ngx_base64_encoded_length(32) + 1];
+    ngx_str_t   src, dst, htu_cstr, htm_cstr;
+    ngx_int_t   rc = NGX_ERROR;
+
+    if (lcf->dpop_key.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: oidc_dpop is on but oidc_dpop_key is not set");
+        return NGX_ERROR;
+    }
+
+    alg = jwt_str_alg((const char *) lcf->dpop_alg.data);
+    if (alg == JWT_ALG_INVAL) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_oidc_random_hex(jti, 32) != NGX_OK) {
+        return NGX_ERROR;
+    }
+    jti[64] = '\0';
+
+    if (ngx_http_oidc_str_copy(r->pool, &htu_cstr, (char *) htu->data,
+                               htu->len) != NGX_OK
+        || ngx_http_oidc_str_copy(r->pool, &htm_cstr, (char *) htm->data,
+                                  htm->len) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    if (jwt_new(&jwt) != 0 || jwt == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (jwt_set_alg(jwt, alg, lcf->dpop_key.data, (int) lcf->dpop_key.len) != 0
+        || jwt_add_header(jwt, "typ", "dpop+jwt") != 0
+        || jwt_add_headers_json(jwt, (const char *) lcf->dpop_jwk.data) != 0
+        || jwt_add_grant(jwt, "jti", (const char *) jti) != 0
+        || jwt_add_grant(jwt, "htm", (const char *) htm_cstr.data) != 0
+        || jwt_add_grant(jwt, "htu", (const char *) htu_cstr.data) != 0
+        || jwt_add_grant_int(jwt, "iat", (long) ngx_time()) != 0)
+    {
+        goto done;
+    }
+
+    if (token != NULL && token->len) {
+        SHA256(token->data, token->len, digest);
+
+        src.data = digest;
+        src.len  = sizeof(digest);
+        dst.data = ath;
+        ngx_encode_base64url(&dst, &src);
+        dst.data[dst.len] = '\0';
+
+        if (jwt_add_grant(jwt, "ath", (const char *) ath) != 0) {
+            goto done;
+        }
+    }
+
+    encoded = jwt_encode_str(jwt);
+    if (encoded == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: could not sign the DPoP proof");
+        goto done;
+    }
+
+    rc = ngx_http_oidc_str_copy(r->pool, out, encoded, ngx_strlen(encoded));
+    jwt_free_str(encoded);
+
+done:
+
+    jwt_free(jwt);
+
+    /* libjwt leaves failures in the OpenSSL error queue; NGINX would later
+     * report them as "stale global SSL error" on an unrelated handshake. */
+    ERR_clear_error();
+
+    if (rc != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: could not build the DPoP proof");
+    }
+
+    return rc;
+}
+
+
+/*
+ * Attach a proof to the next internal subrequest.
+ */
+static ngx_int_t
+ngx_http_oidc_dpop_for(ngx_http_request_t *r, ngx_http_oidc_loc_conf_t *lcf,
+    ngx_http_oidc_ctx_t *ctx, const char *method, ngx_str_t *url,
+    ngx_str_t *token)
+{
+    ngx_str_t  htm, htu;
+
+    ngx_str_null(&ctx->dpop_proof);
+
+    if (!lcf->dpop) {
+        return NGX_OK;
+    }
+
+    htm.data = (u_char *) method;
+    htm.len  = ngx_strlen(method);
+
+    /* The htu is the endpoint without query or fragment. */
+    htu = *url;
+    {
+        u_char  *q = ngx_strlchr(htu.data, htu.data + htu.len, '?');
+        if (q != NULL) {
+            htu.len = q - htu.data;
+        }
+    }
+
+    return ngx_http_oidc_dpop_build(r, lcf, &htm, &htu, token,
+                                    &ctx->dpop_proof);
+}
+
+
+/*
+ * RFC 8705 section 5: when the client authenticates with a certificate the
+ * provider may expose separate endpoints for it.
+ */
+static ngx_str_t *
+ngx_http_oidc_token_endpoint(ngx_http_oidc_loc_conf_t *lcf,
+    ngx_http_oidc_ctx_t *ctx)
+{
+    if (lcf->client_auth == OIDC_CLIENT_AUTH_MTLS
+        && ctx->metadata->mtls_token_endpoint.len)
+    {
+        return &ctx->metadata->mtls_token_endpoint;
+    }
+
+    return &ctx->metadata->token_endpoint;
+}
+
+
+static ngx_str_t *
+ngx_http_oidc_introspect_endpoint(ngx_http_oidc_loc_conf_t *lcf,
+    ngx_http_oidc_ctx_t *ctx)
+{
+    if (lcf->client_auth == OIDC_CLIENT_AUTH_MTLS
+        && ctx->metadata->mtls_introspection_endpoint.len)
+    {
+        return &ctx->metadata->mtls_introspection_endpoint;
+    }
+
+    return &ctx->metadata->introspection_endpoint;
+}
+
+
+/*
+ * Build the query string of the authorization request and remember the values
+ * that have to be checked when the browser comes back.
+ */
+static ngx_int_t
+ngx_http_oidc_build_auth_params(ngx_http_request_t *r,
     ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx)
 {
-    ngx_table_elt_t  *location;
-    ngx_str_t        *auth_endpoint = &ctx->metadata->authorization_endpoint;
-    ngx_str_t         state, nonce, verifier, return_to, esc_return_to;
-    ngx_str_t         extra = ngx_null_string;
-    u_char            state_buf[64], nonce_buf[64], verifier_buf[64];
-    u_char            challenge[43];
-    size_t            challenge_len, len;
-    u_char           *p;
-    ngx_uint_t        has_query;
-
-    if (auth_endpoint->len == 0) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
+    ngx_str_t   extra = ngx_null_string;
+    u_char      challenge[43];
+    u_char     *p;
+    size_t      challenge_len, len;
 
     /*
      * oidc_auth_request_args lets a deployment add parameters such as
@@ -2843,60 +3784,54 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
     if (lcf->auth_args != NULL
         && ngx_http_complex_value(r, lcf->auth_args, &extra) != NGX_OK)
     {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return NGX_ERROR;
     }
 
-    if (ngx_http_oidc_random_hex(state_buf, 32) != NGX_OK
-        || ngx_http_oidc_random_hex(nonce_buf, 32) != NGX_OK
-        || ngx_http_oidc_random_hex(verifier_buf, 32) != NGX_OK)
+    ctx->auth_state.data    = ngx_pnalloc(r->pool, 64);
+    ctx->auth_nonce.data    = ngx_pnalloc(r->pool, 64);
+    ctx->auth_verifier.data = ngx_pnalloc(r->pool, 64);
+
+    if (ctx->auth_state.data == NULL || ctx->auth_nonce.data == NULL
+        || ctx->auth_verifier.data == NULL)
+    {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_oidc_random_hex(ctx->auth_state.data, 32) != NGX_OK
+        || ngx_http_oidc_random_hex(ctx->auth_nonce.data, 32) != NGX_OK
+        || ngx_http_oidc_random_hex(ctx->auth_verifier.data, 32) != NGX_OK)
     {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "OIDC: RAND_bytes() failed");
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return NGX_ERROR;
     }
 
-    state.data    = state_buf;    state.len    = sizeof(state_buf);
-    nonce.data    = nonce_buf;    nonce.len    = sizeof(nonce_buf);
-    verifier.data = verifier_buf; verifier.len = sizeof(verifier_buf);
+    ctx->auth_state.len    = 64;
+    ctx->auth_nonce.len    = 64;
+    ctx->auth_verifier.len = 64;
 
-    challenge_len = ngx_http_oidc_pkce_challenge(challenge, verifier.data,
-                                                 verifier.len);
+    challenge_len = ngx_http_oidc_pkce_challenge(challenge,
+                                                 ctx->auth_verifier.data,
+                                                 ctx->auth_verifier.len);
 
-    /* ---- authorization endpoint URL ---- */
-
-    has_query = (ngx_strlchr(auth_endpoint->data,
-                             auth_endpoint->data + auth_endpoint->len, '?')
-                 != NULL);
-
-    len = auth_endpoint->len + 1
-        + sizeof("response_type=code") - 1
+    len = sizeof("response_type=code") - 1
         + sizeof("&scope=") - 1 + ngx_http_oidc_escaped_len(&lcf->oidc_scope)
         + sizeof("&client_id=") - 1 + ngx_http_oidc_escaped_len(&lcf->client_id)
         + sizeof("&redirect_uri=") - 1
             + ngx_http_oidc_escaped_len(&lcf->redirect_uri)
-        + sizeof("&state=") - 1 + state.len
-        + sizeof("&nonce=") - 1 + nonce.len
+        + sizeof("&state=") - 1 + ctx->auth_state.len
+        + sizeof("&nonce=") - 1 + ctx->auth_nonce.len
         + sizeof("&code_challenge=") - 1 + challenge_len
         + sizeof("&code_challenge_method=S256") - 1
         + (extra.len ? 1 + extra.len : 0);
 
-    location = ngx_list_push(&r->headers_out.headers);
-    if (location == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    ctx->auth_params.data = ngx_pnalloc(r->pool, len);
+    if (ctx->auth_params.data == NULL) {
+        return NGX_ERROR;
     }
 
-    location->hash = 1;
-    ngx_str_set(&location->key, "Location");
-    location->value.data = ngx_pnalloc(r->pool, len);
-    if (location->value.data == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    p = ngx_cpymem(location->value.data, auth_endpoint->data,
-                   auth_endpoint->len);
-    *p++ = has_query ? '&' : '?';
-
-    p = ngx_cpymem(p, "response_type=code", sizeof("response_type=code") - 1);
+    p = ngx_cpymem(ctx->auth_params.data, "response_type=code",
+                   sizeof("response_type=code") - 1);
 
     p = ngx_cpymem(p, "&scope=", sizeof("&scope=") - 1);
     p = ngx_http_oidc_escape(p, &lcf->oidc_scope);
@@ -2908,10 +3843,10 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
     p = ngx_http_oidc_escape(p, &lcf->redirect_uri);
 
     p = ngx_cpymem(p, "&state=", sizeof("&state=") - 1);
-    p = ngx_cpymem(p, state.data, state.len);
+    p = ngx_cpymem(p, ctx->auth_state.data, ctx->auth_state.len);
 
     p = ngx_cpymem(p, "&nonce=", sizeof("&nonce=") - 1);
-    p = ngx_cpymem(p, nonce.data, nonce.len);
+    p = ngx_cpymem(p, ctx->auth_nonce.data, ctx->auth_nonce.len);
 
     p = ngx_cpymem(p, "&code_challenge=", sizeof("&code_challenge=") - 1);
     p = ngx_cpymem(p, challenge, challenge_len);
@@ -2924,11 +3859,56 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
         p = ngx_cpymem(p, extra.data, extra.len);
     }
 
+    ctx->auth_params.len = p - ctx->auth_params.data;
+
+    return NGX_OK;
+}
+
+
+/*
+ * Emit the 302 to the authorization endpoint together with the cookies that
+ * carry the login transaction.
+ */
+static ngx_int_t
+ngx_http_oidc_send_auth_redirect(ngx_http_request_t *r,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx, ngx_str_t *query)
+{
+    ngx_table_elt_t  *location;
+    ngx_str_t        *endpoint = &ctx->metadata->authorization_endpoint;
+    ngx_str_t         return_to, esc_return_to;
+    u_char           *p;
+    size_t            i;
+    ngx_uint_t        has_query;
+
+    if (endpoint->len == 0) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    has_query = (ngx_strlchr(endpoint->data, endpoint->data + endpoint->len,
+                             '?') != NULL);
+
+    location = ngx_list_push(&r->headers_out.headers);
+    if (location == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    location->hash = 1;
+    ngx_str_set(&location->key, "Location");
+    location->value.data = ngx_pnalloc(r->pool,
+                                       endpoint->len + 1 + query->len);
+    if (location->value.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    p = ngx_cpymem(location->value.data, endpoint->data, endpoint->len);
+    *p++ = has_query ? '&' : '?';
+    p = ngx_cpymem(p, query->data, query->len);
+
     location->value.len = p - location->value.data;
 
     /* ---- transaction cookies ---- */
 
-    return_to.len  = r->uri.len + (r->args.len ? 1 + r->args.len : 0);
+    return_to.len = r->uri.len + (r->args.len ? 1 + r->args.len : 0);
     if (return_to.len > OIDC_RETURN_TO_MAX) {
         return_to.len = r->uri.len;
     }
@@ -2957,17 +3937,23 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
     (void) ngx_http_oidc_escape(esc_return_to.data, &return_to);
 
     if (ngx_http_oidc_add_cookie(r, "oidc_state", sizeof("oidc_state") - 1,
-                                 &state, 600) != NGX_OK
+                                 &ctx->auth_state, 600) != NGX_OK
         || ngx_http_oidc_add_cookie(r, "oidc_nonce", sizeof("oidc_nonce") - 1,
-                                    &nonce, 600) != NGX_OK
+                                    &ctx->auth_nonce, 600) != NGX_OK
         || ngx_http_oidc_add_cookie(r, "oidc_pkce_verifier",
                                     sizeof("oidc_pkce_verifier") - 1,
-                                    &verifier, 600) != NGX_OK
+                                    &ctx->auth_verifier, 600) != NGX_OK
         || ngx_http_oidc_add_cookie(r, "oidc_return_to",
                                     sizeof("oidc_return_to") - 1,
                                     &esc_return_to, 600) != NGX_OK)
     {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    for (i = 0; i < location->value.len; i++) {
+        if (location->value.data[i] < 0x20) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
 
     r->headers_out.status   = NGX_HTTP_MOVED_TEMPORARILY;
@@ -2977,9 +3963,198 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
 }
 
 
-/* ------------------------------------------------------------------------ *
- *  Token request
- * ------------------------------------------------------------------------ */
+static ngx_int_t ngx_http_oidc_par_handler(ngx_http_request_t *r, void *data,
+    ngx_int_t rc);
+
+
+/*
+ * RFC 9126: push the authorization request to the provider and use the
+ * request_uri it returns instead of putting the parameters in the redirect.
+ */
+static ngx_int_t
+ngx_http_oidc_start_par_request(ngx_http_request_t *r,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx)
+{
+    ngx_http_request_t          *sr;
+    ngx_http_post_subrequest_t  *psr;
+    ngx_str_t                    uri = ngx_string("/_oidc_par");
+    size_t                       len;
+    u_char                      *p;
+
+    if (ngx_http_oidc_client_auth_prepare(r, lcf, ctx) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    len = ctx->auth_params.len + ngx_http_oidc_client_auth_len(lcf, ctx);
+
+    ctx->par_body.data = ngx_pnalloc(r->pool, len);
+    if (ctx->par_body.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    p = ngx_cpymem(ctx->par_body.data, ctx->auth_params.data,
+                   ctx->auth_params.len);
+    p = ngx_http_oidc_client_auth_append(p, lcf, ctx);
+
+    ctx->par_body.len = p - ctx->par_body.data;
+    ctx->par_url      = ctx->metadata->par_endpoint;
+    ctx->token_basic  = (lcf->client_auth == OIDC_CLIENT_AUTH_BASIC)
+                        ? lcf->client_basic : (ngx_str_t) ngx_null_string;
+
+    psr = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
+    if (psr == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    psr->handler = ngx_http_oidc_par_handler;
+    psr->data    = NULL;
+
+    ctx->par_attempted = 1;
+
+    if (ngx_http_subrequest(r, &uri, NULL, &sr, psr,
+                            NGX_HTTP_SUBREQUEST_IN_MEMORY) != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ctx->waiting = 1;
+
+    return NGX_AGAIN;
+}
+
+
+static ngx_int_t
+ngx_http_oidc_par_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
+{
+    ngx_http_request_t        *pr = r->parent;
+    ngx_http_oidc_ctx_t       *ctx;
+    ngx_http_oidc_loc_conf_t  *lcf;
+    ngx_str_t                  body, request_uri, query;
+    json_t                    *root, *v;
+    json_error_t               jerr;
+    u_char                    *p;
+    size_t                     len;
+    ngx_int_t                  status;
+
+    if (pr == NULL) {
+        return NGX_ERROR;
+    }
+
+    ctx = ngx_http_get_module_ctx(pr, ngx_http_oidc_module);
+    lcf = ngx_http_get_module_loc_conf(pr, ngx_http_oidc_module);
+    if (ctx == NULL || lcf == NULL) {
+        ngx_http_oidc_finish(pr, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_OK;
+    }
+
+    if (ctx->par_handled || ctx->done) {
+        return rc;
+    }
+    ctx->par_handled = 1;
+
+    status = r->headers_out.status;
+
+    if (rc == NGX_ERROR
+        || (status != NGX_HTTP_OK && status != NGX_HTTP_CREATED))
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: the PAR request failed, status: %ui", status);
+        ngx_http_oidc_finish(pr, NGX_HTTP_BAD_GATEWAY);
+        return NGX_OK;
+    }
+
+    if (ngx_http_oidc_subrequest_body(r, &body) != NGX_OK) {
+        ngx_http_oidc_finish(pr, NGX_HTTP_BAD_GATEWAY);
+        return NGX_OK;
+    }
+
+    root = json_loadb((const char *) body.data, body.len, 0, &jerr);
+    if (root == NULL || !json_is_object(root)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: PAR response JSON parse error: %s", jerr.text);
+        if (root) {
+            json_decref(root);
+        }
+        ngx_http_oidc_finish(pr, NGX_HTTP_BAD_GATEWAY);
+        return NGX_OK;
+    }
+
+    v = json_object_get(root, "request_uri");
+
+    if (!json_is_string(v)
+        || ngx_http_oidc_str_copy(pr->pool, &request_uri,
+                                  json_string_value(v),
+                                  ngx_strlen(json_string_value(v))) != NGX_OK)
+    {
+        json_decref(root);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: the PAR response has no request_uri");
+        ngx_http_oidc_finish(pr, NGX_HTTP_BAD_GATEWAY);
+        return NGX_OK;
+    }
+
+    json_decref(root);
+
+    len = sizeof("client_id=") - 1 + ngx_http_oidc_escaped_len(&lcf->client_id)
+        + sizeof("&request_uri=") - 1 + ngx_http_oidc_escaped_len(&request_uri);
+
+    query.data = ngx_pnalloc(pr->pool, len);
+    if (query.data == NULL) {
+        ngx_http_oidc_finish(pr, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_OK;
+    }
+
+    p = ngx_cpymem(query.data, "client_id=", sizeof("client_id=") - 1);
+    p = ngx_http_oidc_escape(p, &lcf->client_id);
+    p = ngx_cpymem(p, "&request_uri=", sizeof("&request_uri=") - 1);
+    p = ngx_http_oidc_escape(p, &request_uri);
+
+    query.len = p - query.data;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "OIDC: authorization request pushed");
+
+    ngx_http_oidc_finish(pr,
+                         ngx_http_oidc_send_auth_redirect(pr, lcf, ctx, &query));
+
+    return NGX_OK;
+}
+
+
+/*
+ * Send the browser to the IdP, pushing the request first when the provider
+ * requires it or oidc_par is on.
+ */
+static ngx_int_t
+ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx)
+{
+    ngx_uint_t  par;
+
+    if (ctx->auth_params.len == 0
+        && ngx_http_oidc_build_auth_params(r, lcf, ctx) != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    par = (lcf->par == NGX_CONF_UNSET) ? ctx->metadata->require_par
+                                       : (ngx_uint_t) lcf->par;
+
+    if (par && !ctx->par_attempted) {
+
+        if (ctx->metadata->par_endpoint.len == 0) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "OIDC: the provider advertises no pushed "
+                          "authorization request endpoint");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        return ngx_http_oidc_start_par_request(r, lcf, ctx);
+    }
+
+    return ngx_http_oidc_send_auth_redirect(r, lcf, ctx, &ctx->auth_params);
+}
+
 
 /*
  * Build the client assertion used by client_secret_jwt and private_key_jwt
@@ -3053,7 +4228,7 @@ ngx_http_oidc_client_assertion(ngx_http_request_t *r,
     if (jwt_add_grant(jwt, "iss", (const char *) lcf->client_id.data) != 0
         || jwt_add_grant(jwt, "sub", (const char *) lcf->client_id.data) != 0
         || jwt_add_grant(jwt, "aud",
-               (const char *) ctx->metadata->token_endpoint.data) != 0
+               (const char *) ngx_http_oidc_token_endpoint(lcf, ctx)->data) != 0
         || jwt_add_grant(jwt, "jti", (const char *) jti) != 0
         || jwt_add_grant_int(jwt, "iat", (long) now) != 0
         || jwt_add_grant_int(jwt, "exp", (long) (now + 60)) != 0)
@@ -3076,6 +4251,7 @@ ngx_http_oidc_client_assertion(ngx_http_request_t *r,
 done:
 
     jwt_free(jwt);
+    ERR_clear_error();
 
     return rc;
 }
@@ -3166,8 +4342,14 @@ ngx_http_oidc_send_token_request(ngx_http_request_t *r,
 
     ctx->token_basic = (lcf->client_auth == OIDC_CLIENT_AUTH_BASIC)
                        ? lcf->client_basic : (ngx_str_t) ngx_null_string;
-    ctx->token_url   = ctx->metadata->token_endpoint;
+    ctx->token_url   = *ngx_http_oidc_token_endpoint(lcf, ctx);
     ctx->phase       = phase;
+
+    if (ngx_http_oidc_dpop_for(r, lcf, ctx, "POST", &ctx->token_url, NULL)
+        != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     psr = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
     if (psr == NULL) {
@@ -3202,6 +4384,7 @@ ngx_http_oidc_start_token_request(ngx_http_request_t *r,
     u_char    *p;
 
     if (lcf->client_auth != OIDC_CLIENT_AUTH_PRIVATE_JWT
+        && lcf->client_auth != OIDC_CLIENT_AUTH_MTLS
         && lcf->client_secret.len == 0)
     {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -3440,6 +4623,13 @@ ngx_http_oidc_token_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
                           ? ngx_time() + (time_t) json_integer_value(v)
                           : 0;
 
+    v = json_object_get(root, "token_type");
+    if (json_is_string(v)) {
+        (void) ngx_http_oidc_str_copy(pr->pool, &ctx->token_type,
+                                      json_string_value(v),
+                                      ngx_strlen(json_string_value(v)));
+    }
+
     v = json_object_get(root, "id_token");
 
     if (json_is_string(v)) {
@@ -3670,6 +4860,13 @@ ngx_http_oidc_verify_signature(ngx_http_request_t *r, ngx_str_t *jwks_json,
     }
 
     json_decref(root);
+
+    /*
+     * Verification failures leave entries in the OpenSSL error queue, which
+     * NGINX would later report as "stale global SSL error" on an unrelated
+     * handshake.
+     */
+    ERR_clear_error();
 
     if (rc != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -4045,11 +5242,13 @@ ngx_http_oidc_start_userinfo_request(ngx_http_request_t *r)
     ngx_http_request_t          *sr;
     ngx_http_post_subrequest_t  *psr;
     ngx_http_oidc_ctx_t         *ctx;
+    ngx_http_oidc_loc_conf_t    *lcf;
     ngx_str_t                    uri = ngx_string("/_oidc_userinfo");
     size_t                       len;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_oidc_module);
-    if (ctx == NULL || ctx->access_token.len == 0) {
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_oidc_module);
+    if (ctx == NULL || lcf == NULL || ctx->access_token.len == 0) {
         return NGX_ERROR;
     }
 
@@ -4058,17 +5257,24 @@ ngx_http_oidc_start_userinfo_request(ngx_http_request_t *r)
      * that it never travels as a subrequest argument (which would end up in
      * the upstream request line and therefore in logs).
      */
-    len = sizeof("Bearer ") - 1 + ctx->access_token.len;
+    len = sizeof("Bearer ") - 1 + ctx->access_token.len;   /* "DPoP " is shorter */
     ctx->userinfo_bearer.data = ngx_pnalloc(r->pool, len);
     if (ctx->userinfo_bearer.data == NULL) {
         return NGX_ERROR;
     }
 
     ctx->userinfo_bearer.len =
-        ngx_snprintf(ctx->userinfo_bearer.data, len, "Bearer %V",
-                     &ctx->access_token) - ctx->userinfo_bearer.data;
+        ngx_snprintf(ctx->userinfo_bearer.data, len, "%s %V",
+                     lcf->dpop ? "DPoP" : "Bearer", &ctx->access_token)
+        - ctx->userinfo_bearer.data;
 
     ctx->userinfo_url = ctx->metadata->userinfo_endpoint;
+
+    if (ngx_http_oidc_dpop_for(r, lcf, ctx, "GET", &ctx->userinfo_url,
+                               &ctx->access_token) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
 
     psr = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
     if (psr == NULL) {
@@ -4583,6 +5789,10 @@ ngx_http_oidc_load_session(ngx_http_request_t *r,
 
 /*
  * Completion handler of every Redis call.
+ *
+ * Drives the queue: a sentinel lookup is retried on the next sentinel, a
+ * cluster redirect is followed, and the operation is only reported once the
+ * last command has answered.
  */
 static ngx_int_t
 ngx_http_oidc_redis_done(ngx_http_request_t *r, void *data, ngx_int_t rc)
@@ -4592,7 +5802,10 @@ ngx_http_oidc_redis_done(ngx_http_request_t *r, void *data, ngx_int_t rc)
     ngx_http_oidc_loc_conf_t   *lcf;
     ngx_http_oidc_main_conf_t  *mcf;
     ngx_http_oidc_redis_ctx_t  *rctx;
-    ngx_uint_t                  ok, after;
+    ngx_str_t                  *items, args[2], key;
+    ngx_url_t                   u;
+    ngx_uint_t                  ok, after, i;
+    ngx_int_t                   next;
 
     if (pr == NULL) {
         return NGX_ERROR;
@@ -4613,13 +5826,110 @@ ngx_http_oidc_redis_done(ngx_http_request_t *r, void *data, ngx_int_t rc)
 
     rctx = ngx_http_get_module_ctx(r, ngx_http_oidc_module);
     ok   = (rc != NGX_ERROR && r->headers_out.status == NGX_HTTP_OK);
-    after = ctx->redis_after;
 
-    if (!ok && r->headers_out.status != NGX_HTTP_NOT_FOUND) {
+    /* ---- sentinel: learn the master and start over ---- */
+
+    if (ctx->redis_in_sentinel) {
+
+        if (ok && rctx != NULL && rctx->items != NULL
+            && rctx->items->nelts >= 2)
+        {
+            items = rctx->items->elts;
+
+            ngx_memzero(&u, sizeof(ngx_url_t));
+            u.url.len  = items[0].len + 1 + items[1].len;
+            u.url.data = ngx_pnalloc(pr->pool, u.url.len);
+
+            if (u.url.data != NULL) {
+                ngx_sprintf(u.url.data, "%V:%V", &items[0], &items[1]);
+                u.no_resolve = 1;
+
+                if (ngx_parse_url(pr->pool, &u) == NGX_OK && u.naddrs > 0) {
+                    ngx_memcpy(&mcf->redis_master, u.addrs[0].sockaddr,
+                               u.addrs[0].socklen);
+                    mcf->redis_master_len   = u.addrs[0].socklen;
+                    mcf->redis_master_valid = 1;
+
+                    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                                  "OIDC: redis master is \"%V\"", &u.url);
+
+                    ctx->redis_peer = NULL;
+
+                    next = ngx_http_oidc_redis_next(pr, ctx);
+                    if (next == NGX_AGAIN) {
+                        return NGX_OK;
+                    }
+                }
+            }
+        }
+
+        /* This sentinel did not answer; try the next one. */
+        ctx->sentinel_index++;
+        ctx->redis_peer = NULL;
+
+        if (mcf->redis_sentinels != NULL
+            && ctx->sentinel_index < mcf->redis_sentinels->nelts)
+        {
+            if (ngx_http_oidc_redis_next(pr, ctx) == NGX_AGAIN) {
+                return NGX_OK;
+            }
+        }
+
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "OIDC: the redis request failed, status: %ui",
-                      r->headers_out.status);
+                      "OIDC: no sentinel could name the redis master");
+        ok = 0;
+        goto failed;
     }
+
+    /* ---- cluster: follow MOVED / ASK ---- */
+
+    if (ok && rctx != NULL && rctx->moved) {
+
+        if (++ctx->redis_tries <= OIDC_REDIS_MAX_TRIES
+            && ngx_http_oidc_redis_redirect(pr, ctx, mcf, &rctx->error)
+               == NGX_OK)
+        {
+            if (ngx_http_oidc_redis_next(pr, ctx) == NGX_AGAIN) {
+                return NGX_OK;
+            }
+        }
+
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: too many redis redirects");
+        ok = 0;
+    }
+
+    if (!ok) {
+
+        if (r->headers_out.status != NGX_HTTP_NOT_FOUND) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "OIDC: the redis request failed, status: %ui",
+                          r->headers_out.status);
+        }
+
+        /*
+         * A failed call in sentinel mode usually means the master moved;
+         * forget it so the next request asks a sentinel again.
+         */
+        if (mcf->redis_topology == OIDC_REDIS_SENTINEL_MODE
+            && r->headers_out.status != NGX_HTTP_NOT_FOUND)
+        {
+            mcf->redis_master_valid = 0;
+
+            if (++ctx->redis_tries <= 1) {
+                ctx->sentinel_index = 0;
+                ctx->redis_peer     = NULL;
+
+                if (ngx_http_oidc_redis_next(pr, ctx) == NGX_AGAIN) {
+                    return NGX_OK;
+                }
+            }
+        }
+    }
+
+failed:
+
+    after = ctx->redis_after;
 
     switch (ctx->redis_op) {
 
@@ -4636,6 +5946,40 @@ ngx_http_oidc_redis_done(ngx_http_request_t *r, void *data, ngx_int_t rc)
         break;
 
     case OIDC_REDIS_PURGE:
+
+        /*
+         * Cluster mode: the first command listed the members, now delete the
+         * sessions and the index itself.
+         */
+        if (ok && rctx != NULL && rctx->items != NULL
+            && ctx->redis_pos == 0
+            && mcf->redis_topology == OIDC_REDIS_CLUSTER_MODE)
+        {
+            items = rctx->items->elts;
+
+            for (i = 0; i < rctx->items->nelts; i++) {
+
+                if (items[i].len == 0) {
+                    continue;
+                }
+
+                ngx_str_set(&args[0], "DEL");
+                ngx_http_oidc_redis_key(pr, "oidc:s:", &items[i], &key);
+                args[1] = key;
+
+                if (key.len == 0
+                    || ngx_http_oidc_redis_push(pr, ctx, args, 2, &key)
+                       != NGX_OK)
+                {
+                    break;
+                }
+            }
+
+            ngx_str_set(&args[0], "DEL");
+            args[1] = ctx->purge_key;
+            (void) ngx_http_oidc_redis_push(pr, ctx, args, 2, &ctx->purge_key);
+        }
+
         ctx->purged = 1;
         break;
 
@@ -4656,6 +6000,20 @@ ngx_http_oidc_redis_done(ngx_http_request_t *r, void *data, ngx_int_t rc)
 
     default:
         break;
+    }
+
+    /* ---- more commands in the queue? ---- */
+
+    if (ok && ctx->redis_ops != NULL
+        && ctx->redis_pos + 1 < ctx->redis_ops->nelts)
+    {
+        ctx->redis_pos++;
+        ctx->redis_tries = 0;
+        ctx->redis_peer  = NULL;
+
+        if (ngx_http_oidc_redis_next(pr, ctx) == NGX_AGAIN) {
+            return NGX_OK;
+        }
     }
 
     switch (after) {
@@ -4728,7 +6086,7 @@ ngx_http_oidc_start_introspect_request(ngx_http_request_t *r,
     p = ngx_http_oidc_client_auth_append(p, lcf, ctx);
 
     ctx->introspect_body.len = p - ctx->introspect_body.data;
-    ctx->introspect_url      = ctx->metadata->introspection_endpoint;
+    ctx->introspect_url      = *ngx_http_oidc_introspect_endpoint(lcf, ctx);
     ctx->token_basic         = (lcf->client_auth == OIDC_CLIENT_AUTH_BASIC)
                                ? lcf->client_basic
                                : (ngx_str_t) ngx_null_string;
@@ -5466,7 +6824,7 @@ ngx_http_oidc_copy_metadata(ngx_pool_t *pool,
         return NULL;
     }
 
-    for (i = 0; i < sizeof(*dst) / sizeof(ngx_str_t); i++) {
+    for (i = 0; i < OIDC_METADATA_STRINGS; i++) {
         d = (ngx_str_t *) dst + i;
         s = (ngx_str_t *) src + i;
 
@@ -5480,6 +6838,8 @@ ngx_http_oidc_copy_metadata(ngx_pool_t *pool,
             return NULL;
         }
     }
+
+    dst->require_par = src->require_par;
 
     return dst;
 }
@@ -5688,7 +7048,7 @@ ngx_http_oidc_access_handler(ngx_http_request_t *r)
             if (lcf->introspection
                 && !ctx->introspect_attempted
                 && ctx->access_token.len > 0
-                && ctx->metadata->introspection_endpoint.len > 0
+                && ngx_http_oidc_introspect_endpoint(lcf, ctx)->len > 0
                 && ngx_time() - ctx->introspected
                    >= lcf->introspection_interval)
             {
@@ -5764,6 +7124,81 @@ ngx_http_oidc_claim_variable(ngx_http_request_t *r,
 
     v->len          = value->len;
     v->data         = value->data;
+    v->valid        = 1;
+    v->no_cacheable = 0;
+    v->not_found    = 0;
+
+    return NGX_OK;
+}
+
+
+/*
+ * $oidc_dpop_backend_proof
+ *
+ * A proof bound to the access token for the request being proxied upstream,
+ * so that a DPoP aware resource server can validate it.  The htu defaults to
+ * the URL of the current request and can be overridden with oidc_dpop_htu.
+ */
+static ngx_int_t
+ngx_http_oidc_dpop_backend_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_oidc_loc_conf_t  *lcf;
+    ngx_http_oidc_ctx_t       *ctx;
+    ngx_str_t                  htu, proof;
+    u_char                    *p;
+    size_t                     len;
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_oidc_module);
+    ctx = ngx_http_get_module_ctx(r->main, ngx_http_oidc_module);
+
+    if (ctx == NULL || !lcf->dpop || ctx->access_token.len == 0) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    if (lcf->dpop_htu != NULL) {
+        if (ngx_http_complex_value(r, lcf->dpop_htu, &htu) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+    } else {
+        ngx_str_t  host = r->headers_in.server;
+        ngx_str_t  scheme;
+
+#if (NGX_HTTP_SSL)
+        if (r->connection->ssl) {
+            ngx_str_set(&scheme, "https");
+        } else
+#endif
+        {
+            ngx_str_set(&scheme, "http");
+        }
+
+        len = scheme.len + sizeof("://") - 1 + host.len + r->uri.len;
+
+        htu.data = ngx_pnalloc(r->pool, len);
+        if (htu.data == NULL) {
+            return NGX_ERROR;
+        }
+
+        p = ngx_cpymem(htu.data, scheme.data, scheme.len);
+        p = ngx_cpymem(p, "://", sizeof("://") - 1);
+        p = ngx_cpymem(p, host.data, host.len);
+        p = ngx_cpymem(p, r->uri.data, r->uri.len);
+
+        htu.len = p - htu.data;
+    }
+
+    if (ngx_http_oidc_dpop_build(r, lcf, &r->method_name, &htu,
+                                 &ctx->access_token, &proof) != NGX_OK)
+    {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    v->len          = proof.len;
+    v->data         = proof.data;
     v->valid        = 1;
     v->no_cacheable = 0;
     v->not_found    = 0;
@@ -5855,6 +7290,9 @@ ngx_http_oidc_create_loc_conf(ngx_conf_t *cf)
     conf->session_timeout   = NGX_CONF_UNSET;
     conf->session_claims    = NGX_CONF_UNSET_PTR;
     conf->client_auth       = NGX_CONF_UNSET_UINT;
+    conf->par               = NGX_CONF_UNSET;
+    conf->dpop              = NGX_CONF_UNSET;
+    conf->dpop_htu          = NGX_CONF_UNSET_PTR;
     conf->refresh_token     = NGX_CONF_UNSET;
     conf->introspection     = NGX_CONF_UNSET;
     conf->introspection_interval = NGX_CONF_UNSET;
@@ -6030,6 +7468,9 @@ ngx_http_oidc_apply_provider(ngx_conf_t *cf, ngx_http_oidc_loc_conf_t *conf)
     OIDC_INHERIT_STR(client_jwt_key)
     OIDC_INHERIT_STR(client_jwt_kid)
     OIDC_INHERIT_STR(client_jwt_alg)
+    OIDC_INHERIT_STR(dpop_key)
+    OIDC_INHERIT_STR(dpop_jwk)
+    OIDC_INHERIT_STR(dpop_alg)
 
 #undef OIDC_INHERIT_STR
 
@@ -6043,6 +7484,18 @@ ngx_http_oidc_apply_provider(ngx_conf_t *cf, ngx_http_oidc_loc_conf_t *conf)
 
     if (conf->client_auth == NGX_CONF_UNSET_UINT) {
         conf->client_auth = p->client_auth;
+    }
+
+    if (conf->par == NGX_CONF_UNSET) {
+        conf->par = p->par;
+    }
+
+    if (conf->dpop == NGX_CONF_UNSET) {
+        conf->dpop = p->dpop;
+    }
+
+    if (conf->dpop_htu == NGX_CONF_UNSET_PTR) {
+        conf->dpop_htu = p->dpop_htu;
     }
 
     if (conf->refresh_token == NGX_CONF_UNSET) {
@@ -6099,6 +7552,21 @@ ngx_http_oidc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                              prev->post_logout_redirect_uri, "");
     ngx_conf_merge_uint_value(conf->client_auth, prev->client_auth,
                               OIDC_CLIENT_AUTH_BASIC);
+    ngx_conf_merge_value(conf->dpop, prev->dpop, 0);
+    ngx_conf_merge_ptr_value(conf->dpop_htu, prev->dpop_htu, NULL);
+
+    if (conf->dpop_key.len == 0) {
+        conf->dpop_key = prev->dpop_key;
+        conf->dpop_jwk = prev->dpop_jwk;
+        conf->dpop_alg = prev->dpop_alg;
+    }
+
+    if (conf->dpop == 1 && conf->dpop_key.len == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "oidc_dpop is on but oidc_dpop_key is not set");
+        return NGX_CONF_ERROR;
+    }
+
     ngx_conf_merge_str_value(conf->client_jwt_kid, prev->client_jwt_kid, "");
 
     if (conf->client_jwt_key.len == 0) {
@@ -6113,6 +7581,10 @@ ngx_http_oidc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->client_jwt_alg.data == NULL) {
         conf->client_jwt_alg = prev->client_jwt_alg;
     }
+    if (conf->par == NGX_CONF_UNSET) {
+        conf->par = prev->par;        /* stays unset: follow the provider */
+    }
+
     ngx_conf_merge_value(conf->refresh_token, prev->refresh_token, 0);
     ngx_conf_merge_value(conf->introspection, prev->introspection, 0);
     ngx_conf_merge_sec_value(conf->introspection_interval,
@@ -6166,7 +7638,8 @@ ngx_http_oidc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (conf->auth_oidc == 1
         && conf->client_secret.len == 0
-        && conf->client_auth != OIDC_CLIENT_AUTH_PRIVATE_JWT)
+        && conf->client_auth != OIDC_CLIENT_AUTH_PRIVATE_JWT
+        && conf->client_auth != OIDC_CLIENT_AUTH_MTLS)
     {
         ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
                            "auth_oidc is on but oidc_client_secret is not set");
@@ -6219,8 +7692,75 @@ static ngx_conf_enum_t  ngx_http_oidc_client_auth[] = {
     { ngx_string("post"),             OIDC_CLIENT_AUTH_POST },
     { ngx_string("client_secret_jwt"), OIDC_CLIENT_AUTH_SECRET_JWT },
     { ngx_string("private_key_jwt"),  OIDC_CLIENT_AUTH_PRIVATE_JWT },
+    { ngx_string("mtls"),             OIDC_CLIENT_AUTH_MTLS },
     { ngx_null_string, 0 }
 };
+
+
+/*
+ * Read a PEM file named relative to the configuration prefix.
+ */
+static ngx_int_t
+ngx_http_oidc_read_pem(ngx_conf_t *cf, ngx_str_t *name, ngx_str_t *out)
+{
+    ngx_file_t       file;
+    ngx_file_info_t  fi;
+    ssize_t          n;
+    size_t           size;
+
+    if (ngx_conf_full_name(cf->cycle, name, 1) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(&file, sizeof(ngx_file_t));
+    file.name = *name;
+    file.log  = cf->log;
+
+    file.fd = ngx_open_file(name->data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    if (file.fd == NGX_INVALID_FILE) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           ngx_open_file_n " \"%V\" failed", name);
+        return NGX_ERROR;
+    }
+
+    if (ngx_fd_info(file.fd, &fi) == NGX_FILE_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           ngx_fd_info_n " \"%V\" failed", name);
+        goto failed;
+    }
+
+    size = (size_t) ngx_file_size(&fi);
+    if (size == 0 || size > 64 * 1024) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"%V\" is not a usable key file", name);
+        goto failed;
+    }
+
+    out->data = ngx_pnalloc(cf->pool, size + 1);
+    if (out->data == NULL) {
+        goto failed;
+    }
+
+    n = ngx_read_file(&file, out->data, size, 0);
+    if (n != (ssize_t) size) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           ngx_read_file_n " \"%V\" failed", name);
+        goto failed;
+    }
+
+    out->data[size] = '\0';
+    out->len = size;
+
+    ngx_close_file(file.fd);
+
+    return NGX_OK;
+
+failed:
+
+    ngx_close_file(file.fd);
+
+    return NGX_ERROR;
+}
 
 
 /*
@@ -6235,68 +7775,49 @@ ngx_http_oidc_client_jwt_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_http_oidc_loc_conf_t  *lcf = conf;
     ngx_str_t                 *value = cf->args->elts;
     ngx_str_t                  name = value[1];
-    ngx_file_t                 file;
-    ngx_file_info_t            fi;
-    ssize_t                    n;
-    size_t                     size;
 
     if (lcf->client_jwt_key.len) {
         return "is duplicate";
     }
 
-    if (ngx_conf_full_name(cf->cycle, &name, 1) != NGX_OK) {
+    if (ngx_http_oidc_read_pem(cf, &name, &lcf->client_jwt_key) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
-
-    ngx_memzero(&file, sizeof(ngx_file_t));
-    file.name = name;
-    file.log  = cf->log;
-
-    file.fd = ngx_open_file(name.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
-    if (file.fd == NGX_INVALID_FILE) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                           ngx_open_file_n " \"%V\" failed", &name);
-        return NGX_CONF_ERROR;
-    }
-
-    if (ngx_fd_info(file.fd, &fi) == NGX_FILE_ERROR) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                           ngx_fd_info_n " \"%V\" failed", &name);
-        goto failed;
-    }
-
-    size = (size_t) ngx_file_size(&fi);
-    if (size == 0 || size > 64 * 1024) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "\"%V\" is not a usable key file", &name);
-        goto failed;
-    }
-
-    lcf->client_jwt_key.data = ngx_pnalloc(cf->pool, size + 1);
-    if (lcf->client_jwt_key.data == NULL) {
-        goto failed;
-    }
-
-    n = ngx_read_file(&file, lcf->client_jwt_key.data, size, 0);
-    if (n != (ssize_t) size) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                           ngx_read_file_n " \"%V\" failed", &name);
-        goto failed;
-    }
-
-    lcf->client_jwt_key.data[size] = '\0';
-    lcf->client_jwt_key.len = size;
-
-    ngx_close_file(file.fd);
 
     return NGX_CONF_OK;
-
-failed:
-
-    ngx_close_file(file.fd);
-
-    return NGX_CONF_ERROR;
 }
+
+
+/*
+ * oidc_dpop_key <file>
+ *
+ * Loads the EC private key used to sign DPoP proofs and derives the public
+ * JWK that every proof carries in its header.
+ */
+static char *
+ngx_http_oidc_dpop_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_oidc_loc_conf_t  *lcf = conf;
+    ngx_str_t                 *value = cf->args->elts;
+    ngx_str_t                  name = value[1];
+
+    if (lcf->dpop_key.len) {
+        return "is duplicate";
+    }
+
+    if (ngx_http_oidc_read_pem(cf, &name, &lcf->dpop_key) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_http_oidc_dpop_jwk(cf, &lcf->dpop_key, &lcf->dpop_jwk,
+                               &lcf->dpop_alg) != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
 
 
 /*
@@ -6354,6 +7875,89 @@ ngx_http_oidc_session_store(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     mcf->shm_zone->data = shm;
     mcf->shm_size = size;
     mcf->store    = OIDC_STORE_SHM;
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * oidc_redis_sentinel <addr> [<addr>...]
+ *
+ * Ask these sentinels for the address of the master named by
+ * oidc_redis_master.  The answer is cached per worker and forgotten as soon
+ * as a call to the master fails, which is how a failover is picked up.
+ */
+static char *
+ngx_http_oidc_redis_sentinel(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_oidc_main_conf_t  *mcf = conf;
+    ngx_str_t                  *value = cf->args->elts;
+    ngx_addr_t                 *addr;
+    ngx_url_t                   u;
+    ngx_uint_t                  i;
+
+    if (mcf->redis_sentinels == NULL) {
+        mcf->redis_sentinels = ngx_array_create(cf->pool, cf->args->nelts - 1,
+                                                sizeof(ngx_addr_t));
+        if (mcf->redis_sentinels == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    for (i = 1; i < cf->args->nelts; i++) {
+
+        ngx_memzero(&u, sizeof(ngx_url_t));
+        u.url          = value[i];
+        u.default_port = 26379;
+
+        if (ngx_parse_url(cf->pool, &u) != NGX_OK || u.naddrs == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid sentinel address \"%V\"", &value[i]);
+            return NGX_CONF_ERROR;
+        }
+
+        addr = ngx_array_push(mcf->redis_sentinels);
+        if (addr == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        *addr = u.addrs[0];
+    }
+
+    mcf->redis_topology = OIDC_REDIS_SENTINEL_MODE;
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * oidc_redis_cluster on|off
+ */
+static char *
+ngx_http_oidc_redis_cluster(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_oidc_main_conf_t  *mcf = conf;
+    ngx_str_t                  *value = cf->args->elts;
+
+    if (value[1].len == 2 && ngx_strncasecmp(value[1].data,
+                                             (u_char *) "on", 2) == 0)
+    {
+        if (mcf->redis_topology == OIDC_REDIS_SENTINEL_MODE) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "oidc_redis_cluster and oidc_redis_sentinel "
+                               "are mutually exclusive");
+            return NGX_CONF_ERROR;
+        }
+
+        mcf->redis_topology = OIDC_REDIS_CLUSTER_MODE;
+
+        mcf->cluster_slots = ngx_palloc(cf->pool, OIDC_CLUSTER_SLOTS);
+        if (mcf->cluster_slots == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        ngx_memset(mcf->cluster_slots, 0xff, OIDC_CLUSTER_SLOTS);
+    }
 
     return NGX_CONF_OK;
 }
@@ -6745,6 +8349,30 @@ static ngx_command_t ngx_http_oidc_commands[] = {
       offsetof(ngx_http_oidc_loc_conf_t, client_auth),
       &ngx_http_oidc_client_auth },
 
+    /* Bind the tokens to a key with DPoP (RFC 9449). */
+    { ngx_string("oidc_dpop"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, dpop),
+      NULL },
+
+    /* EC private key signing the DPoP proofs. */
+    { ngx_string("oidc_dpop_key"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_oidc_dpop_key,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    /* htu of the proof handed to the backend ($oidc_dpop_backend_proof). */
+    { ngx_string("oidc_dpop_htu"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_set_complex_value_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, dpop_htu),
+      NULL },
+
     /* PEM private key signing the client assertion of private_key_jwt. */
     { ngx_string("oidc_client_jwt_key"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
@@ -6767,6 +8395,17 @@ static ngx_command_t ngx_http_oidc_commands[] = {
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_oidc_loc_conf_t, client_jwt_alg),
+      NULL },
+
+    /*
+     * Pushed Authorization Requests (RFC 9126).  Unset follows the provider's
+     * require_pushed_authorization_requests.
+     */
+    { ngx_string("oidc_par"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, par),
       NULL },
 
     /* Renew the tokens with the refresh token.  Needs oidc_session_store. */
@@ -6806,6 +8445,30 @@ static ngx_command_t ngx_http_oidc_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_oidc_redis_pass,
       NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    /* Sentinels that know where the master is. */
+    { ngx_string("oidc_redis_sentinel"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
+      ngx_http_oidc_redis_sentinel,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      0,
+      NULL },
+
+    /* Name of the monitored master. */
+    { ngx_string("oidc_redis_master"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_oidc_main_conf_t, redis_master_name),
+      NULL },
+
+    /* Talk to a Redis Cluster: follow MOVED/ASK and route by slot. */
+    { ngx_string("oidc_redis_cluster"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
+      ngx_http_oidc_redis_cluster,
+      NGX_HTTP_MAIN_CONF_OFFSET,
       0,
       NULL },
 
@@ -6890,6 +8553,14 @@ ngx_http_oidc_init_process(ngx_cycle_t *cycle)
         return NGX_OK;
     }
 
+    if (mcf->redis_topology == OIDC_REDIS_SENTINEL_MODE
+        && mcf->redis_master_name.len == 0)
+    {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "OIDC: oidc_redis_sentinel needs oidc_redis_master");
+        return NGX_ERROR;
+    }
+
     if (mcf->cookie_secret.len > 0) {
         u_char  digest[32];
 
@@ -6957,10 +8628,26 @@ ngx_http_oidc_init(ngx_conf_t *cf)
           offsetof(ngx_http_oidc_ctx_t, introspect_url) },
         { ngx_string("oidc_introspect_body"),
           offsetof(ngx_http_oidc_ctx_t, introspect_body) },
+        { ngx_string("oidc_par_url"),
+          offsetof(ngx_http_oidc_ctx_t, par_url) },
+        { ngx_string("oidc_par_body"),
+          offsetof(ngx_http_oidc_ctx_t, par_body) },
+        { ngx_string("oidc_dpop_proof"),
+          offsetof(ngx_http_oidc_ctx_t, dpop_proof) },
+        { ngx_string("oidc_token_type"),
+          offsetof(ngx_http_oidc_ctx_t, token_type) },
         { ngx_null_string, 0 }
     };
 
+    ngx_str_t dpop_backend = ngx_string("oidc_dpop_backend_proof");
     ngx_str_t claim_prefix = ngx_string("oidc_claim_");
+
+    var = ngx_http_add_variable(cf, &dpop_backend, NGX_HTTP_VAR_NOCACHEABLE);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+    var->get_handler = ngx_http_oidc_dpop_backend_variable;
+    var->data = 0;
 
     var = ngx_http_add_variable(cf, &claim_prefix,
                                 NGX_HTTP_VAR_PREFIX|NGX_HTTP_VAR_NOCACHEABLE);

@@ -7,6 +7,7 @@
  */
 const express = require('express');
 const fs = require('fs');
+const https = require('https');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
@@ -60,6 +61,8 @@ app.get('/.well-known/openid-configuration', (req, res) => {
     jwks_uri: `${ISSUER}/certs`,
     userinfo_endpoint: `${ISSUER}/userinfo`,
     end_session_endpoint: `${ISSUER}/logout`,
+    pushed_authorization_request_endpoint: `${ISSUER}/par`,
+    dpop_signing_alg_values_supported: ['ES256'],
     backchannel_logout_supported: true,
     backchannel_logout_session_supported: true,
     frontchannel_logout_supported: true,
@@ -83,7 +86,39 @@ app.get('/certs', (req, res) => {
   res.json({ keys: [{ ...key, use: 'sig', kid: kid, alg: ALG }] });
 });
 
+// request_uri -> pushed parameters
+const parRequests = new Map();
+
+/* RFC 9126: Pushed Authorization Request */
+app.post('/par', (req, res) => {
+  const auth = checkClientAuth(req);
+  if (auth.error) {
+    return res.status(401).json({ error: 'invalid_client', details: auth.error });
+  }
+
+  if (!req.body.response_type || !req.body.code_challenge) {
+    return res.status(400).json({ error: 'invalid_request' });
+  }
+
+  const id = 'urn:ietf:params:oauth:request_uri:'
+             + crypto.randomBytes(16).toString('hex');
+  parRequests.set(id, { ...req.body, auth: auth.method });
+
+  console.log(`[IdP] authorization request pushed (auth=${auth.method})`);
+  res.status(201).json({ request_uri: id, expires_in: 60 });
+});
+
 app.get('/auth', (req, res) => {
+  // 事前送信されたリクエストは request_uri から取り出す
+  if (req.query.request_uri) {
+    const pushed = parRequests.get(req.query.request_uri);
+    if (!pushed) {
+      return res.status(400).send('unknown request_uri');
+    }
+    parRequests.delete(req.query.request_uri);
+    req.query = { ...pushed, ...req.query };
+  }
+
   const { redirect_uri, state, nonce, client_id, code_challenge,
           code_challenge_method } = req.query;
   // テスト用のフラグ（不正な署名 / 不正な aud / 短命なアクセストークン）
@@ -172,6 +207,19 @@ function checkClientAuth(req) {
     return { method: 'basic' };
   }
 
+  // RFC 8705: 証明書を提示していれば client_id だけで足りる
+  const cert = req.socket.getPeerCertificate
+               ? req.socket.getPeerCertificate() : null;
+
+  if (cert && cert.subject && !req.body.client_secret
+      && !req.body.client_assertion)
+  {
+    if (req.body.client_id !== CLIENT_ID) {
+      return { error: 'invalid client_id for mTLS' };
+    }
+    return { method: 'mtls' };
+  }
+
   if (req.body.client_assertion) {
     if (req.body.client_assertion_type
         !== 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer') {
@@ -224,6 +272,53 @@ const clientPublicKey = process.env.MOCK_IDP_CLIENT_PUBKEY
   ? fs.readFileSync(process.env.MOCK_IDP_CLIENT_PUBKEY, 'utf8')
   : null;
 
+/*
+ * DPoP (RFC 9449) の proof を検証する。
+ * 成功すると public JWK のサムプリント代わりに JWK を返す。
+ */
+function checkDpop(req, expectedHtm, expectedHtu, accessToken) {
+  const proof = req.headers['dpop'];
+  if (!proof) {
+    return { error: 'missing DPoP header' };
+  }
+
+  const header = JSON.parse(
+    Buffer.from(proof.split('.')[0], 'base64url').toString('utf8'));
+
+  if (header.typ !== 'dpop+jwt' || !header.jwk) {
+    return { error: 'malformed DPoP header' };
+  }
+
+  let claims;
+  try {
+    const key = crypto.createPublicKey({ key: header.jwk, format: 'jwk' });
+    claims = jwt.verify(proof, key, { algorithms: [header.alg] });
+  } catch (e) {
+    return { error: `DPoP proof rejected: ${e.message}` };
+  }
+
+  if (claims.htm !== expectedHtm) {
+    return { error: `DPoP htm is ${claims.htm}` };
+  }
+  if (claims.htu !== expectedHtu) {
+    return { error: `DPoP htu is ${claims.htu}` };
+  }
+  if (!claims.jti || !claims.iat
+      || Math.abs(Math.floor(Date.now() / 1000) - claims.iat) > 300) {
+    return { error: 'DPoP jti/iat is not acceptable' };
+  }
+
+  if (accessToken) {
+    const ath = crypto.createHash('sha256').update(accessToken)
+                      .digest('base64url');
+    if (claims.ath !== ath) {
+      return { error: 'DPoP ath does not match the access token' };
+    }
+  }
+
+  return { jwk: header.jwk };
+}
+
 // 発行済みのアクセストークン: token -> { active }
 const accessTokens = new Map();
 // 発行済みのリフレッシュトークン: token -> context
@@ -258,7 +353,7 @@ function issueTokens(context, authMethod, refreshed) {
 
   return {
     access_token: accessToken,
-    token_type: 'Bearer',
+    token_type: context.dpop ? 'DPoP' : 'Bearer',
     expires_in: context.shortToken && !refreshed ? 1 : 3600,
     refresh_token: refreshToken,
     id_token: idToken
@@ -281,6 +376,19 @@ app.post('/token', (req, res) => {
 
   const { grant_type, code, code_verifier, refresh_token } = req.body;
 
+  // DPoP の proof が付いていれば検証する
+  let dpop = false;
+  if (req.headers['dpop']) {
+    const check = checkDpop(req, 'POST', `${ISSUER}/token`, null);
+    if (check.error) {
+      console.log(`[IdP] ${check.error}`);
+      return res.status(400).json({ error: 'invalid_dpop_proof',
+                                    details: check.error });
+    }
+    dpop = true;
+    console.log('[IdP] DPoP proof accepted on the token request');
+  }
+
   if (grant_type === 'refresh_token') {
     const context = refreshTokens.get(refresh_token);
     if (!context) {
@@ -289,6 +397,7 @@ app.post('/token', (req, res) => {
     }
     refreshTokens.delete(refresh_token);
 
+    context.dpop = dpop;
     console.log(`[IdP] tokens refreshed (auth=${auth.method})`);
     return res.json(issueTokens(context, auth.method, true));
   }
@@ -312,7 +421,8 @@ app.post('/token', (req, res) => {
     return res.status(400).json({ error: 'invalid_grant', details: 'PKCE' });
   }
 
-  console.log(`[IdP] token issued (auth=${auth.method}, `
+  context.dpop = dpop;
+  console.log(`[IdP] token issued (auth=${auth.method}, dpop=${dpop}, `
               + `bad_sig=${!!context.badSig}, bad_aud=${!!context.badAud})`);
   res.json(issueTokens(context, auth.method, false));
 });
@@ -394,10 +504,21 @@ app.post('/test/revoke', (req, res) => {
 
 app.get('/userinfo', (req, res) => {
   const header = req.headers['authorization'] || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const dpopScheme = header.startsWith('DPoP ');
+  const token = (dpopScheme || header.startsWith('Bearer '))
+                ? header.slice(header.indexOf(' ') + 1) : null;
 
   if (!token || !accessTokens.has(token)) {
     return res.status(401).send('Unauthorized');
+  }
+
+  if (dpopScheme) {
+    const check = checkDpop(req, 'GET', `${ISSUER}/userinfo`, token);
+    if (check.error) {
+      console.log(`[IdP] userinfo ${check.error}`);
+      return res.status(401).send(check.error);
+    }
+    console.log('[IdP] DPoP proof accepted on the UserInfo request');
   }
 
   // groups は配列で返す（モジュール側が配列クレームを扱えることの検証）
@@ -410,6 +531,19 @@ app.get('/userinfo', (req, res) => {
   });
 });
 
-app.listen(port, () => {
-  console.log(`Mock IdP listening at ${ISSUER}`);
-});
+if (process.env.MOCK_IDP_TLS_CERT) {
+  https.createServer({
+    key:  fs.readFileSync(process.env.MOCK_IDP_TLS_KEY),
+    cert: fs.readFileSync(process.env.MOCK_IDP_TLS_CERT),
+    ca:   fs.readFileSync(process.env.MOCK_IDP_TLS_CA),
+    requestCert: true,
+    rejectUnauthorized: false
+  }, app).listen(port, () => {
+    console.log(`Mock IdP listening at ${ISSUER} (TLS, client certs requested)`);
+  });
+
+} else {
+  app.listen(port, () => {
+    console.log(`Mock IdP listening at ${ISSUER}`);
+  });
+}

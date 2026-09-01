@@ -12,6 +12,8 @@ module.exports = defineConfig({
   reporter: 'line',
   use: {
     baseURL: process.env.OIDC_TEST_BASE_URL || 'http://localhost:8080',
+    // mTLS のテスト用 IdP は自己署名証明書を使う
+    ignoreHTTPSErrors: true,
     launchOptions: executablePath ? { executablePath } : {},
   },
 });

@@ -27,7 +27,7 @@ nginx-oidc/
 └── test/                    # E2E テストスイート
     ├── run-e2e.sh           # ビルド〜実行〜後片付けを行うランナー
     ├── e2e.spec.js          # Playwright E2E テスト
-    ├── mock-idp.js          # モック IdP（RS256 / ES256）
+    ├── mock-idp.js          # モック IdP（RS256 / ES256、PAR / DPoP / mTLS 対応）
     ├── nginx.conf           # テスト用 NGINX 設定
     ├── playwright.config.js # Playwright 設定
     └── package.json         # テスト依存関係
@@ -204,7 +204,7 @@ typedef struct {
    アクセスハンドラは先頭で、`done` なら確定した `status` を返し、`waiting` なら `NGX_AGAIN` を返して待機します（`ngx_http_oidc_access_handler`、行 2748 付近）。連鎖の各段は完了時に `ngx_http_oidc_finish()`（行 181）で結果を確定させます。`ngx_http_auth_request_module` の `ctx->done` と同じ考え方です。
 
 2. **完了ハンドラの冪等化**
-   NGINX は同じサブリクエストを複数回 finalize することがあり、そのたびに `post_subrequest` ハンドラが呼ばれます。実際、JWKS サブリクエストは 2 回 finalize され、素朴な実装では ID トークンの検証と UserInfo サブリクエストの発行が二重に走ります。`discovery_handled` / `token_handled` / `jwks_handled` / `userinfo_handled` のフラグで各ハンドラを 1 回だけ実行するようにしています。
+   NGINX は同じサブリクエストを複数回 finalize することがあり、そのたびに `post_subrequest` ハンドラが呼ばれます。実際、JWKS サブリクエストは 2 回 finalize され、素朴な実装では ID トークンの検証と UserInfo サブリクエストの発行が二重に走ります。`discovery_handled` / `token_handled` / `jwks_handled` / `userinfo_handled` / `introspect_handled` / `par_handled` / `redis_handled` のフラグで各ハンドラを 1 回だけ実行するようにしています。
 
 Discovery だけはアクセスハンドラ自身から発行するため、完了時に `done` を立てず `waiting` を下ろすだけで、親はそのままフェーズを続行してキャッシュ済みメタデータで処理を進めます。
 
@@ -222,6 +222,16 @@ Discovery だけはアクセスハンドラ自身から発行するため、完�
   - `GET oidc:s:<sid>`
   - `DEL oidc:s:<sid>`
   - `EVAL <script> ...` — 保存（`SETEX` + 2 つのインデックス集合の `SADD`/`EXPIRE`）と、ログアウト通知による一括削除（`SMEMBERS` してから `DEL`）。どちらも 1 往復で終わり、戻り値は整数なので配列のパースが不要になる。
+
+### 宛先の決定（standalone / Sentinel / Cluster）
+
+コマンドはリクエストごとにキュー（`ctx->redis_ops`）に積まれ、`ngx_http_oidc_redis_next()` が 1 つずつ発行する。宛先は `ngx_http_oidc_redis_route()` がトポロジに応じて決める。
+
+- **standalone**: `oidc_redis_pass` の宛先をそのまま使う。
+- **Sentinel**（`oidc_redis_sentinel` + `oidc_redis_master`）: マスターのアドレスが未知なら、まず Sentinel に `SENTINEL get-master-addr-by-name <name>` を投げる（このときだけ応答は配列なので専用にパースする）。得たアドレスは main conf にワーカー単位でキャッシュし、以後は直接マスターへ送る。コマンドが失敗したらキャッシュを捨て、`sentinel_index` を進めて次の Sentinel に問い合わせ直す。
+- **Cluster**（`oidc_redis_cluster on`）: キーの CRC16（XMODEM、`{...}` のハッシュタグに対応）から slot を求め、16384 バイトのスロットマップ（`mcf->cluster_slots`、値はノード番号、`0xff` が未学習）でノードを引く。未学習なら種のノードへ送り、`MOVED <slot> <host>:<port>` が返ればマップを更新して再送、`ASK` なら（マップは更新せず）`ASKING` を前置して再送する。ノードは最大 64 まで `cluster_node[]` に記憶する。
+
+クラスタでは 1 つのセッションに関わる 3 つのキー（`oidc:s:` / `oidc:x:sid:` / `oidc:x:sub:`）が別々の slot に落ちるため、`EVAL` の Lua スクリプトは使えない。`ngx_http_oidc_redis_save()` と `ngx_http_oidc_redis_purge()` はトポロジを見て、クラスタならキーごとのコマンド（`SETEX` / `SADD` / `EXPIRE`、削除は `SMEMBERS` の結果を読んでから `DEL`）に切り替える。
 
 ## 主要関数の解説
 
@@ -311,6 +321,22 @@ ID トークンと UserInfo のクレームを取り込みます。文字列・�
 
 アルゴリズムの既定値はマージ時ではなくリクエスト時に決めています。マージ時に既定値を書き込むと、親（`client_secret_basic`）の既定 HS256 が、`private_key_jwt` を指定した子ロケーションに継承されてしまうためです。
 
+`oidc_client_auth mtls;`（RFC 8705）では、証明書の提示は NGINX の `proxy_ssl_certificate` に任せ、モジュールはボディに `client_id` だけを載せます（`Authorization` も client assertion も付けません）。`ngx_http_oidc_token_endpoint()` と `ngx_http_oidc_introspect_endpoint()` は、Discovery の `mtls_endpoint_aliases` に対応するエイリアス（`token_endpoint` / `introspection_endpoint`）があればそちらの URL を返します（RFC 8705 5 章）。クライアント認証を伴わない UserInfo はエイリアスを見ません。この方式では `oidc_client_secret` が不要なため、マージ時の必須チェックからも除外しています。
+
+### PAR（RFC 9126）
+
+`oidc_par` が有効（未指定なら Discovery の `require_pushed_authorization_requests`）で、かつ `pushed_authorization_request_endpoint` があるとき、`ngx_http_oidc_redirect_to_idp()` は認可 URL を組み立てる代わりに `/_oidc_par` サブリクエストを発行します。ボディ（`$oidc_par_body`）は通常の認可リクエストのクエリと同じ内容で、クライアント認証も通常のトークンリクエストと同じ方式を使います。応答の `request_uri` を受け取ったら、`client_id` と `request_uri` だけを付けた認可 URL へリダイレクトします。
+
+### DPoP（RFC 9449）
+
+`oidc_dpop_key` の PEM を読み込んだ時点で、`ngx_http_oidc_dpop_jwk()` が公開鍵の DER（`i2d_PUBKEY` の末尾 `1 + 2*coord` バイト）から座標を取り出し、`{"jwk":{"kty":"EC","crv":...,"x":...,"y":...}}` という JWK 断片と署名アルゴリズム（曲線から ES256 / ES384 / ES512）を作って設定に保持します。OpenSSL 1.1 と 3.x で API が分かれる `EC_KEY` 系を避けるための実装です。
+
+`ngx_http_oidc_dpop_build()` は libjwt で proof を組み立てます。ヘッダは `typ: dpop+jwt` と上記の JWK、ペイロードは `htm` / `htu` / `iat` / `jti`、アクセストークンが渡された場合は `ath`（SHA-256 の base64url）も入れます。`ngx_http_oidc_dpop_for()` が内部サブリクエスト（トークン / UserInfo）向けに `$oidc_dpop_proof` を用意し、バックエンド向けには `$oidc_dpop_backend_proof` の変数ハンドラがリクエストのたびに組み立てます（`htu` は `oidc_dpop_htu`、`htm` はリクエストメソッド）。
+
+トークンレスポンスの `token_type` はセッションレコードに保存し（レコード形式バージョン 2）、UserInfo と `$oidc_token_type` で `DPoP` / `Bearer` を出し分けます。
+
+なお libjwt の検証失敗は OpenSSL のエラーキューにエントリを残し、無関係な upstream のハンドシェイクで `ignoring stale global SSL error` として報告されるため、libjwt を呼んだ後には `ERR_clear_error()` を入れています。
+
 ### `oidc_provider` ブロック
 
 http レベルの `oidc_provider <name> { ... }` は、`ngx_http_oidc_create_loc_conf()` で作った設定に短い名前のディレクティブ（`issuer`, `client_id`, ...）を書き込み、名前付きプリセットとして main conf に保存します。`auth_oidc <name>;` を書いたロケーションは、マージ時に `ngx_http_oidc_apply_provider()` が未設定の項目だけをプリセットから埋めます。
@@ -366,7 +392,11 @@ UserInfo の失敗のみ非致命的（警告ログを出して ID トークン�
 | `$oidc_discovery_url` / `$oidc_token_url` / `$oidc_jwks_url` / `$oidc_userinfo_url` | 内部ロケーションの `proxy_pass` 用 |
 | `$oidc_token_body` | トークンリクエストのボディ（`proxy_set_body` 用） |
 | `$oidc_token_basic` | `Basic base64(client_id:client_secret)` |
-| `$oidc_userinfo_bearer` | `Bearer <access_token>` |
+| `$oidc_userinfo_bearer` | `Bearer <access_token>`（DPoP のときは `DPoP <access_token>`） |
+| `$oidc_par_url` / `$oidc_par_body` | PAR サブリクエスト用 |
+| `$oidc_dpop_proof` | 内部サブリクエストに添える DPoP proof |
+| `$oidc_dpop_backend_proof` | バックエンドへ転送する DPoP proof（`htu` は `oidc_dpop_htu`） |
+| `$oidc_token_type` | `Bearer` / `DPoP`。ストアモードでは継続リクエストでも参照可能 |
 
 ---
 
@@ -381,8 +411,9 @@ UserInfo の失敗のみ非致命的（警告ログを出して ID トークン�
 
 ## 残存する課題
 
-| 機能 | 説明 |
+| 項目 | 説明 |
 |------|------|
-| Redis Sentinel / Cluster | 宛先は単一（または `upstream` ブロック）。フェイルオーバーは NGINX の upstream 機能に委ねている |
-| Pushed Authorization Requests (PAR) / DPoP | 認可リクエストの事前送信、トークンの所有証明 |
-| mTLS クライアント認証 | `tls_client_auth` / `self_signed_tls_client_auth` |
+| Redis Cluster のスロットマップ | 起動時に `CLUSTER SLOTS` を取得せず `MOVED` / `ASK` から学習するため、ワーカーごとに最初の数リクエストが 1 往復多くなる |
+| Redis Cluster のノード数 | ワーカーあたり最大 64 ノード（`OIDC_CLUSTER_MAX_NODES`） |
+| Cookie モードでの DPoP | アクセストークンを保持しないため、継続リクエストでは `$oidc_token_type` と `$oidc_dpop_backend_proof` が空になる |
+| Sentinel のマスターキャッシュ | ワーカー単位のため、フェイルオーバー直後は各ワーカーが 1 回ずつ失敗してから解決し直す |

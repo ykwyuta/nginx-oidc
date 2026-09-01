@@ -7,6 +7,7 @@
 - 修正後の再検証: 2026-09-01 — 検出した全件を修正し、実モジュールに対する E2E 8 シナリオが通過
 - 追加機能の実装後: 2026-09-01 — 未実装として残っていた機能を実装し、E2E 14 シナリオ（ストアモード）/ 11 シナリオ（Cookie モード）が通過
 - 残機能の実装後: 2026-09-01 — Redis ストア・Back/Front-Channel Logout・JWT クライアント認証・`oidc_provider` ブロックを実装し、E2E 21 シナリオが共有メモリ / Redis の両モードで通過（Cookie モードは 14 通過・7 スキップ）
+- 最終実装後: 2026-09-01 — PAR・DPoP・mTLS クライアント認証・Redis Sentinel / Cluster を実装し、E2E 24 シナリオが共有メモリ / Redis / Redis Sentinel / Redis Cluster の 4 モードで通過（Cookie モードは 17 通過・7 スキップ）
 
 ---
 
@@ -195,10 +196,44 @@ OIDC: ID token aud does not contain oidc_client_id
 
 `-Werror` を含む既定のフラグでビルド警告ゼロ。アクセスログ・エラーログに `client_secret` / `code_verifier` / トークン類の出現は 0 件、`[alert]` / `[crit]` / `upstream timed out` も 0 件。
 
-## 6. 残タスク
+## 6. 最終実装（PAR / DPoP / mTLS / Redis Sentinel・Cluster）
 
-| 機能 | 説明 |
+| 機能 | 実装内容 |
+|------|---------|
+| **PAR（RFC 9126）** | `oidc_par on\|off` と `/_oidc_par` ロケーション（`$oidc_par_url` / `$oidc_par_body`）を追加。認可リクエストのパラメータをバックチャネルで先に POST し、ブラウザには `client_id` と `request_uri` だけを渡す。ディレクティブ未指定時は Discovery の `require_pushed_authorization_requests` に従い、`pushed_authorization_request_endpoint` が無ければ通常の認可リクエストへフォールバックする |
+| **DPoP（RFC 9449）** | `oidc_dpop on\|off` / `oidc_dpop_key <PEM>` / `oidc_dpop_htu <value>` を追加。EC 秘密鍵から起動時に JWK（`kty` / `crv` / `x` / `y`）を導出し、トークン要求・UserInfo 要求・バックエンド転送用の proof（`typ: dpop+jwt`、`htm` / `htu` / `iat` / `jti`、アクセストークンがあれば `ath`）を組み立てる。トークンが `token_type: DPoP` で返れば `Authorization` を `DPoP <token>` に切り替える。変数は `$oidc_dpop_proof`（内部サブリクエスト用）・`$oidc_dpop_backend_proof`（バックエンド用）・`$oidc_token_type` |
+| **mTLS クライアント認証（RFC 8705）** | `oidc_client_auth mtls;` を追加。証明書自体は `proxy_ssl_certificate` で NGINX に送らせ、モジュールはボディに `client_id` だけを載せる。Discovery に `mtls_endpoint_aliases` があれば、トークンエンドポイントとイントロスペクションエンドポイントをそのエイリアスへ向ける |
+| **Redis Sentinel** | `oidc_redis_sentinel <addr>...` と `oidc_redis_master <name>` を追加。`SENTINEL get-master-addr-by-name` でマスターを解決してワーカーごとにキャッシュし、コマンドが失敗したらキャッシュを捨てて次の Sentinel に問い合わせ直す |
+| **Redis Cluster** | `oidc_redis_cluster on;` を追加。キーの CRC16（XMODEM）から slot を求めてノードを選び、`MOVED` / `ASK` の応答でスロットマップを学習する（`ASK` は `ASKING` を前置）。3 つのキーが別 slot に落ちるため、クラスタでは `EVAL` の Lua スクリプトの代わりにキーごとのコマンド（`SETEX` / `SADD` / `EXPIRE`、削除は `SMEMBERS` + `DEL`）を発行する |
+
+### 実装中に判明した問題
+
+| 問題 | 対処 |
 |------|------|
-| Redis Sentinel / Cluster | 宛先は単一（または `upstream` ブロック）。フェイルオーバーは NGINX の upstream 機能に委ねている |
-| Pushed Authorization Requests (PAR) / DPoP | 認可リクエストの事前送信、トークンの所有証明 |
-| mTLS クライアント認証 | `tls_client_auth` / `self_signed_tls_client_auth` |
+| DPoP proof の組み立てが黙って失敗する | JWK 断片のフォーマット文字列が `"}%Z}"` となっており NUL が最後の `}` の前に入って JSON が壊れていた。`"}}%Z"` に修正し、あわせて `dpop_build` の失敗をエラーログに出すようにした |
+| `ignoring stale global SSL error` の alert | libjwt の署名検証失敗が OpenSSL のエラーキューにエントリを残し、無関係な upstream のハンドシェイクで報告されていた。libjwt 呼び出しの後に `ERR_clear_error()` を追加 |
+| 継続リクエストで `$oidc_token_type` が空 | トークンタイプがセッションレコードに含まれていなかった。レコード形式をバージョン 2 に上げて `token_type` を追加 |
+
+### 再検証
+
+```
+==> running the Playwright tests (session mode: store)
+  24 passed
+==> running the Playwright tests (session mode: redis)
+  24 passed
+==> running the Playwright tests (session mode: sentinel)
+  24 passed
+==> running the Playwright tests (session mode: cluster)
+  24 passed
+==> running the Playwright tests (session mode: cookie)
+  7 skipped
+  17 passed
+```
+
+Cookie モードでスキップされる 7 件は、いずれもサーバー側ストアを前提とする機能（`$oidc_id_token` の継続利用、リフレッシュ、イントロスペクション、Back/Front-Channel Logout）である。DPoP のテストは Cookie モードでも実行するが、アクセストークンを保持しないため `token_type` とバックエンド向け proof の確認だけは行わない。
+
+`-Werror` を含む既定のフラグでビルド警告ゼロ。
+
+## 7. 残タスク
+
+現時点で未実装の機能はない。既知の制限は [README.md の「既知の制限」](README.md#既知の制限) を参照。

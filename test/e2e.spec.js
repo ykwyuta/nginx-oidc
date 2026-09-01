@@ -3,7 +3,7 @@ const { test, expect } = require('@playwright/test');
 const BASE = process.env.OIDC_TEST_BASE_URL || 'http://localhost:8080';
 
 // run-e2e.sh はストアあり (store) と Cookie のみ (cookie) の両方で実行する
-const MODE = process.env.OIDC_TEST_MODE || 'store';   // store | redis | cookie
+const MODE = process.env.OIDC_TEST_MODE || 'store';   // store | redis | sentinel | cluster | cookie
 const STORE = MODE !== 'cookie';
 
 /** IdP の認可 URL にテスト用フラグを足してログインする */
@@ -417,6 +417,66 @@ test.describe('NGINX OIDC module (real dynamic module)', () => {
 
     await page.goto(target);
     await expect(page.locator('h1')).toContainText('Mock IdP Login');
+  });
+
+  test('pushes the authorization request (PAR)', async ({ page }) => {
+    const target = `${BASE}/par/page`;
+
+    await page.goto(target);
+
+    // 事前送信したので、認可 URL には client_id と request_uri しか載らない
+    const url = new URL(page.url());
+    expect(url.searchParams.get('request_uri')).toMatch(/^urn:ietf:params:/);
+    expect(url.searchParams.get('client_id')).toBe('test-client-id');
+    expect(url.searchParams.get('code_challenge')).toBeNull();
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      page.click('button#login-button')
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+  });
+
+  test('binds the tokens to a key with DPoP', async ({ page }) => {
+    const target = `${BASE}/dpop/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    // UserInfo も DPoP で呼べている
+    expect(body.groups).toBe('admin,user');
+
+    // token_type とバックエンド向けの proof はアクセストークンを保持している
+    // 場合だけ得られる（Cookie のみの構成はトークンを残さない）。
+    if (STORE) {
+      // モック IdP は proof を検証したうえで DPoP バインドのトークンを返す
+      expect(body.token_type).toBe('DPoP');
+
+      const [header] = body.dpop_proof.split('.');
+      const decoded = JSON.parse(Buffer.from(header, 'base64url').toString());
+      expect(decoded.typ).toBe('dpop+jwt');
+      expect(decoded.jwk.kty).toBe('EC');
+      expect(decoded.jwk.crv).toBe('P-256');
+    }
+  });
+
+  test('authenticates the client with a certificate (mTLS)', async ({ page }) => {
+    const target = `${BASE}/mtls/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    expect(body.token_auth).toBe('mtls');
   });
 
 });
