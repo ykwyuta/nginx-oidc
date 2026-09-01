@@ -28,6 +28,13 @@
 #define OIDC_COOKIE_EXPIRED       "=; Expires=Thu, 01 Jan 1970 00:00:00 GMT;"    \
                                   " HttpOnly; Secure; SameSite=Lax; Path=/"
 
+/* Maximum size of a single token kept in the shared session store. */
+#define OIDC_MAX_TOKEN_LEN        16384
+
+/* Which step of the flow a token subrequest belongs to. */
+#define OIDC_PHASE_LOGIN          0
+#define OIDC_PHASE_REFRESH        1
+
 
 /*
  * Provider metadata obtained from the discovery document.
@@ -37,7 +44,9 @@ typedef struct {
     ngx_str_t authorization_endpoint;
     ngx_str_t token_endpoint;
     ngx_str_t jwks_uri;
-    ngx_str_t userinfo_endpoint;   /* optional */
+    ngx_str_t userinfo_endpoint;       /* optional */
+    ngx_str_t end_session_endpoint;    /* optional, RP-Initiated Logout */
+    ngx_str_t introspection_endpoint;  /* optional, RFC 7662 */
 } ngx_http_oidc_provider_metadata_t;
 
 
@@ -79,9 +88,12 @@ typedef struct {
  * Main configuration: only worker-wide state (the session cookie HMAC key).
  */
 typedef struct {
-    u_char      hmac_secret[32];
-    ngx_uint_t  secret_initialized:1;
-    ngx_str_t   cookie_secret;
+    u_char           hmac_secret[32];
+    ngx_uint_t       secret_initialized:1;
+    ngx_str_t        cookie_secret;
+
+    ngx_shm_zone_t  *shm_zone;   /* oidc_session_store: server side sessions */
+    ssize_t          shm_size;
 } ngx_http_oidc_main_conf_t;
 
 
@@ -99,8 +111,18 @@ typedef struct {
     time_t       session_timeout;
     ngx_array_t *session_claims;      /* ngx_str_t, NULL = every non-protocol claim */
 
+    ngx_str_t    logout_uri;                /* oidc_logout_uri */
+    ngx_str_t    post_logout_redirect_uri;
+    ngx_uint_t   client_auth_post;          /* oidc_client_auth post */
+    ngx_flag_t   refresh_token;             /* oidc_refresh_token */
+    ngx_flag_t   introspection;             /* oidc_introspection */
+    time_t       introspection_interval;
+    ngx_http_complex_value_t *auth_args;    /* oidc_auth_request_args */
+
     ngx_str_t    client_basic;        /* "Basic base64(client_id:client_secret)" */
+    ngx_str_t    client_post;         /* "&client_secret=..." for client_secret_post */
     ngx_str_t    callback_path;       /* path part of oidc_redirect_uri */
+    ngx_str_t    logout_path;         /* path part of oidc_logout_uri */
     ngx_http_oidc_cache_t *cache;     /* per-location discovery cache */
 } ngx_http_oidc_loc_conf_t;
 
@@ -133,11 +155,22 @@ typedef struct {
     ngx_uint_t token_handled:1;
     ngx_uint_t jwks_handled:1;
     ngx_uint_t userinfo_handled:1;
+    ngx_uint_t introspect_handled:1;
+
+    ngx_uint_t refresh_attempted:1;
+    ngx_uint_t refreshed:1;
+    ngx_uint_t introspect_attempted:1;
+
+    ngx_uint_t phase;                 /* OIDC_PHASE_LOGIN / OIDC_PHASE_REFRESH */
 
     ngx_int_t  status;                /* final status once `done` is set */
 
     ngx_str_t  id_token;
     ngx_str_t  access_token;
+    ngx_str_t  refresh_token;
+    time_t     access_expires;        /* 0 when the IdP sent no expires_in */
+    time_t     introspected;          /* last successful introspection */
+    ngx_str_t  sid;                   /* server side session id (store mode) */
     ngx_http_oidc_claims_t claims;
     ngx_array_t *extra_claims;
 
@@ -146,9 +179,11 @@ typedef struct {
     ngx_str_t  token_url;
     ngx_str_t  jwks_url;
     ngx_str_t  userinfo_url;
+    ngx_str_t  introspect_url;
     ngx_str_t  token_body;
     ngx_str_t  token_basic;
     ngx_str_t  userinfo_bearer;
+    ngx_str_t  introspect_body;
 } ngx_http_oidc_ctx_t;
 
 
@@ -167,6 +202,10 @@ static ngx_int_t ngx_http_oidc_userinfo_handler(ngx_http_request_t *r,
     void *data, ngx_int_t rc);
 static void ngx_http_oidc_issue_session_and_redirect(ngx_http_request_t *r,
     ngx_http_oidc_ctx_t *ctx, ngx_http_oidc_main_conf_t *mcf);
+static ngx_int_t ngx_http_oidc_save_session(ngx_http_request_t *r,
+    ngx_http_oidc_ctx_t *ctx, ngx_http_oidc_main_conf_t *mcf,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_str_t *cookie);
+static time_t ngx_http_oidc_session_lifetime(ngx_http_oidc_loc_conf_t *lcf);
 
 
 /* ------------------------------------------------------------------------ *
@@ -1054,6 +1093,610 @@ ngx_http_oidc_merge_claims(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
 
 
 /* ------------------------------------------------------------------------ *
+ *  Session payload (shared by the cookie and the shared memory store)
+ * ------------------------------------------------------------------------ */
+
+/*
+ * Serialise the claims:
+ *
+ *   B64(sub):B64(email):B64(name):issued_at[|B64(key):B64(value)]...
+ *
+ * Every field is Base64 encoded so that ':' inside a value cannot confuse the
+ * parser.  The result is capped at OIDC_SESSION_MAX_PAYLOAD bytes so that a
+ * cookie built from it stays within the browser's 4096 byte limit.
+ */
+static ngx_int_t
+ngx_http_oidc_build_claims(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
+    time_t issued, ngx_str_t *out)
+{
+    ngx_http_oidc_claim_entry_t  *entries;
+    ngx_str_t                     sub_b64, email_b64, name_b64;
+    u_char                       *p, *buf;
+    size_t                        len, i;
+
+    sub_b64.len   = ngx_base64_encoded_length(ctx->claims.sub.len);
+    email_b64.len = ngx_base64_encoded_length(ctx->claims.email.len);
+    name_b64.len  = ngx_base64_encoded_length(ctx->claims.name.len);
+
+    sub_b64.data   = ngx_pnalloc(r->pool, sub_b64.len);
+    email_b64.data = ngx_pnalloc(r->pool, email_b64.len);
+    name_b64.data  = ngx_pnalloc(r->pool, name_b64.len);
+
+    if (sub_b64.data == NULL || email_b64.data == NULL
+        || name_b64.data == NULL)
+    {
+        return NGX_ERROR;
+    }
+
+    ngx_encode_base64(&sub_b64,   &ctx->claims.sub);
+    ngx_encode_base64(&email_b64, &ctx->claims.email);
+    ngx_encode_base64(&name_b64,  &ctx->claims.name);
+
+    len = sub_b64.len + email_b64.len + name_b64.len + 3 + NGX_TIME_T_LEN;
+
+    if (ctx->extra_claims != NULL) {
+        entries = ctx->extra_claims->elts;
+        for (i = 0; i < ctx->extra_claims->nelts; i++) {
+            len += 2 + ngx_base64_encoded_length(entries[i].key.len)
+                     + ngx_base64_encoded_length(entries[i].value.len);
+        }
+    }
+
+    buf = ngx_pnalloc(r->pool, len);
+    if (buf == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_snprintf(buf, len, "%V:%V:%V:%T", &sub_b64, &email_b64, &name_b64,
+                     issued);
+
+    if (ctx->extra_claims != NULL) {
+        entries = ctx->extra_claims->elts;
+
+        for (i = 0; i < ctx->extra_claims->nelts; i++) {
+            ngx_str_t kb64, vb64;
+            size_t    need;
+
+            kb64.len = ngx_base64_encoded_length(entries[i].key.len);
+            vb64.len = ngx_base64_encoded_length(entries[i].value.len);
+            need     = 2 + kb64.len + vb64.len;
+
+            if ((size_t) (p - buf) + need > OIDC_SESSION_MAX_PAYLOAD) {
+                ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                              "OIDC: session payload budget exhausted, "
+                              "claim \"%V\" was dropped", &entries[i].key);
+                continue;
+            }
+
+            kb64.data = ngx_pnalloc(r->pool, kb64.len);
+            vb64.data = ngx_pnalloc(r->pool, vb64.len);
+            if (kb64.data == NULL || vb64.data == NULL) {
+                break;
+            }
+
+            ngx_encode_base64(&kb64, &entries[i].key);
+            ngx_encode_base64(&vb64, &entries[i].value);
+
+            *p++ = '|';
+            p = ngx_cpymem(p, kb64.data, kb64.len);
+            *p++ = ':';
+            p = ngx_cpymem(p, vb64.data, vb64.len);
+        }
+    }
+
+    out->data = buf;
+    out->len  = p - buf;
+
+    return NGX_OK;
+}
+
+
+/*
+ * Restore the claims serialised by ngx_http_oidc_build_claims().
+ */
+static ngx_int_t
+ngx_http_oidc_parse_claims(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
+    ngx_str_t *payload, time_t *issued)
+{
+    ngx_str_t   enc, dec;
+    ngx_str_t  *field[3];
+    u_char     *pl, *end, *c1, *c2, *c3, *ts_end, *pipe, *ep;
+    ngx_uint_t  i;
+
+    pl  = payload->data;
+    end = payload->data + payload->len;
+
+    c1 = ngx_strlchr(pl, end, ':');
+    if (c1 == NULL) {
+        return NGX_DECLINED;
+    }
+    c2 = ngx_strlchr(c1 + 1, end, ':');
+    if (c2 == NULL) {
+        return NGX_DECLINED;
+    }
+    c3 = ngx_strlchr(c2 + 1, end, ':');
+    if (c3 == NULL) {
+        return NGX_DECLINED;
+    }
+
+    pipe   = ngx_strlchr(c3 + 1, end, '|');
+    ts_end = pipe ? pipe : end;
+
+    *issued = ngx_atotm(c3 + 1, ts_end - (c3 + 1));
+    if (*issued == NGX_ERROR) {
+        return NGX_DECLINED;
+    }
+
+    field[0] = &ctx->claims.sub;
+    field[1] = &ctx->claims.email;
+    field[2] = &ctx->claims.name;
+
+    enc.data = pl;
+    enc.len  = c1 - pl;
+
+    for (i = 0; i < 3; i++) {
+        if (i == 1) {
+            enc.data = c1 + 1;
+            enc.len  = c2 - (c1 + 1);
+        } else if (i == 2) {
+            enc.data = c2 + 1;
+            enc.len  = c3 - (c2 + 1);
+        }
+
+        dec.data = ngx_pnalloc(r->pool, ngx_base64_decoded_length(enc.len));
+        if (dec.data == NULL) {
+            return NGX_ERROR;
+        }
+
+        if (ngx_decode_base64(&dec, &enc) == NGX_OK) {
+            *field[i] = dec;
+        }
+    }
+
+    if (pipe == NULL) {
+        return NGX_OK;
+    }
+
+    ep = pipe + 1;
+
+    while (ep < end) {
+        u_char    *next  = ngx_strlchr(ep, end, '|');
+        u_char    *stop  = next ? next : end;
+        u_char    *colon = ngx_strlchr(ep, stop, ':');
+        ngx_str_t  kenc, venc, kdec, vdec;
+
+        if (colon != NULL) {
+            kenc.data = ep;
+            kenc.len  = colon - ep;
+            venc.data = colon + 1;
+            venc.len  = stop - (colon + 1);
+
+            kdec.data = ngx_pnalloc(r->pool,
+                                    ngx_base64_decoded_length(kenc.len) + 1);
+            vdec.data = ngx_pnalloc(r->pool,
+                                    ngx_base64_decoded_length(venc.len) + 1);
+
+            if (kdec.data != NULL && vdec.data != NULL
+                && ngx_decode_base64(&kdec, &kenc) == NGX_OK
+                && ngx_decode_base64(&vdec, &venc) == NGX_OK)
+            {
+                kdec.data[kdec.len] = '\0';
+
+                if (ctx->extra_claims == NULL) {
+                    ctx->extra_claims = ngx_array_create(r->pool, 8,
+                                   sizeof(ngx_http_oidc_claim_entry_t));
+                }
+
+                if (ctx->extra_claims != NULL) {
+                    ngx_http_oidc_claim_entry_t *entry =
+                        ngx_array_push(ctx->extra_claims);
+                    if (entry != NULL) {
+                        entry->key   = kdec;
+                        entry->value = vdec;
+                    }
+                }
+            }
+        }
+
+        if (next == NULL) {
+            break;
+        }
+        ep = next + 1;
+    }
+
+    return NGX_OK;
+}
+
+
+/* ------------------------------------------------------------------------ *
+ *  Shared memory session store (oidc_session_store)
+ *
+ *  Keeping the session server side is what makes the ID token, the access
+ *  token and the refresh token usable after the login request: they are far
+ *  too large, and the refresh token too sensitive, to travel in a cookie.
+ *  With the store enabled the cookie carries nothing but a 256 bit random
+ *  session id.
+ * ------------------------------------------------------------------------ */
+
+typedef struct {
+    ngx_rbtree_node_t  node;          /* node.key = crc32 of the session id */
+    ngx_queue_t        queue;         /* LRU, most recently used first */
+    time_t             expires;
+    time_t             issued;
+    time_t             access_expires;
+    time_t             introspected;
+    u_char             sid[64];
+    u_short            id_token_len;
+    u_short            access_token_len;
+    u_short            refresh_token_len;
+    u_short            claims_len;
+    u_char             data[1];
+} ngx_http_oidc_sess_t;
+
+
+typedef struct {
+    ngx_rbtree_t       rbtree;
+    ngx_rbtree_node_t  sentinel;
+    ngx_queue_t        queue;
+} ngx_http_oidc_shctx_t;
+
+
+typedef struct {
+    ngx_http_oidc_shctx_t  *sh;
+    ngx_slab_pool_t        *shpool;
+} ngx_http_oidc_shm_t;
+
+
+static void
+ngx_http_oidc_rbtree_insert_value(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+{
+    ngx_rbtree_node_t     **p;
+    ngx_http_oidc_sess_t   *sn, *snt;
+
+    for ( ;; ) {
+
+        if (node->key < temp->key) {
+            p = &temp->left;
+
+        } else if (node->key > temp->key) {
+            p = &temp->right;
+
+        } else {
+            sn  = (ngx_http_oidc_sess_t *) node;
+            snt = (ngx_http_oidc_sess_t *) temp;
+
+            p = (ngx_memcmp(sn->sid, snt->sid, sizeof(sn->sid)) < 0)
+                ? &temp->left : &temp->right;
+        }
+
+        if (*p == sentinel) {
+            break;
+        }
+
+        temp = *p;
+    }
+
+    *p = node;
+    node->parent = temp;
+    node->left   = sentinel;
+    node->right  = sentinel;
+    ngx_rbt_red(node);
+}
+
+
+static ngx_int_t
+ngx_http_oidc_init_zone(ngx_shm_zone_t *shm_zone, void *data)
+{
+    ngx_http_oidc_shm_t  *octx = shm_zone->data;
+    ngx_http_oidc_shm_t  *oshm = data;   /* previous cycle */
+
+    if (oshm) {
+        octx->sh     = oshm->sh;
+        octx->shpool = oshm->shpool;
+        return NGX_OK;
+    }
+
+    octx->shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+
+    if (shm_zone->shm.exists) {
+        octx->sh = octx->shpool->data;
+        return NGX_OK;
+    }
+
+    octx->sh = ngx_slab_alloc(octx->shpool, sizeof(ngx_http_oidc_shctx_t));
+    if (octx->sh == NULL) {
+        return NGX_ERROR;
+    }
+
+    octx->shpool->data = octx->sh;
+
+    ngx_rbtree_init(&octx->sh->rbtree, &octx->sh->sentinel,
+                    ngx_http_oidc_rbtree_insert_value);
+    ngx_queue_init(&octx->sh->queue);
+
+    octx->shpool->log_ctx = ngx_slab_alloc(octx->shpool,
+                                           sizeof(" in OIDC session store"));
+    if (octx->shpool->log_ctx == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_sprintf(octx->shpool->log_ctx, "%s%Z", " in OIDC session store");
+
+    return NGX_OK;
+}
+
+
+/* The shared pool mutex must be held by the caller. */
+static ngx_http_oidc_sess_t *
+ngx_http_oidc_sess_lookup(ngx_http_oidc_shctx_t *sh, ngx_str_t *sid)
+{
+    ngx_rbtree_node_t     *node, *sentinel;
+    ngx_http_oidc_sess_t  *sess;
+    uint32_t               hash;
+    ngx_int_t              rc;
+
+    if (sid->len != 64) {
+        return NULL;
+    }
+
+    hash     = ngx_crc32_short(sid->data, sid->len);
+    node     = sh->rbtree.root;
+    sentinel = sh->rbtree.sentinel;
+
+    while (node != sentinel) {
+
+        if (hash < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if (hash > node->key) {
+            node = node->right;
+            continue;
+        }
+
+        sess = (ngx_http_oidc_sess_t *) node;
+
+        rc = ngx_memcmp(sid->data, sess->sid, sizeof(sess->sid));
+        if (rc == 0) {
+            return sess;
+        }
+
+        node = (rc < 0) ? node->left : node->right;
+    }
+
+    return NULL;
+}
+
+
+static void
+ngx_http_oidc_sess_remove(ngx_http_oidc_shm_t *shm, ngx_http_oidc_sess_t *sess)
+{
+    ngx_queue_remove(&sess->queue);
+    ngx_rbtree_delete(&shm->sh->rbtree, &sess->node);
+    ngx_slab_free_locked(shm->shpool, sess);
+}
+
+
+/*
+ * Drop expired sessions, oldest first.  When `force` is set one live session
+ * is evicted as well so that a new one can be stored in a full zone.
+ */
+static void
+ngx_http_oidc_sess_expire(ngx_http_oidc_shm_t *shm, ngx_uint_t force)
+{
+    ngx_queue_t           *q;
+    ngx_http_oidc_sess_t  *sess;
+    time_t                 now = ngx_time();
+    ngx_uint_t             i;
+
+    for (i = 0; i < 16; i++) {
+
+        if (ngx_queue_empty(&shm->sh->queue)) {
+            return;
+        }
+
+        q    = ngx_queue_last(&shm->sh->queue);
+        sess = ngx_queue_data(q, ngx_http_oidc_sess_t, queue);
+
+        if (!force && sess->expires > now) {
+            return;
+        }
+
+        ngx_http_oidc_sess_remove(shm, sess);
+
+        if (force) {
+            return;
+        }
+    }
+}
+
+
+static ngx_int_t
+ngx_http_oidc_sess_store(ngx_http_request_t *r, ngx_shm_zone_t *zone,
+    ngx_str_t *sid, ngx_str_t *claims, ngx_str_t *id_token,
+    ngx_str_t *access_token, ngx_str_t *refresh_token,
+    time_t issued, time_t expires, time_t access_expires, time_t introspected)
+{
+    ngx_http_oidc_shm_t   *shm = zone->data;
+    ngx_http_oidc_sess_t  *sess;
+    size_t                 size;
+    u_char                *p;
+    ngx_uint_t             tries;
+
+    if (sid->len != 64
+        || id_token->len > OIDC_MAX_TOKEN_LEN
+        || access_token->len > OIDC_MAX_TOKEN_LEN
+        || refresh_token->len > OIDC_MAX_TOKEN_LEN)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: session data is too large for the store");
+        return NGX_ERROR;
+    }
+
+    size = offsetof(ngx_http_oidc_sess_t, data)
+         + claims->len + id_token->len + access_token->len + refresh_token->len;
+
+    ngx_shmtx_lock(&shm->shpool->mutex);
+
+    sess = ngx_http_oidc_sess_lookup(shm->sh, sid);
+    if (sess != NULL) {
+        ngx_http_oidc_sess_remove(shm, sess);
+    }
+
+    ngx_http_oidc_sess_expire(shm, 0);
+
+    for (tries = 0; ; tries++) {
+        sess = ngx_slab_alloc_locked(shm->shpool, size);
+        if (sess != NULL) {
+            break;
+        }
+
+        if (tries >= 8 || ngx_queue_empty(&shm->sh->queue)) {
+            ngx_shmtx_unlock(&shm->shpool->mutex);
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "OIDC: the session store is full, "
+                          "increase oidc_session_store");
+            return NGX_ERROR;
+        }
+
+        ngx_http_oidc_sess_expire(shm, 1);
+    }
+
+    sess->node.key      = ngx_crc32_short(sid->data, sid->len);
+    sess->expires       = expires;
+    sess->issued        = issued;
+    sess->access_expires = access_expires;
+    sess->introspected  = introspected;
+    ngx_memcpy(sess->sid, sid->data, sizeof(sess->sid));
+
+    sess->claims_len        = (u_short) claims->len;
+    sess->id_token_len      = (u_short) id_token->len;
+    sess->access_token_len  = (u_short) access_token->len;
+    sess->refresh_token_len = (u_short) refresh_token->len;
+
+    p = sess->data;
+    p = ngx_cpymem(p, claims->data, claims->len);
+    p = ngx_cpymem(p, id_token->data, id_token->len);
+    p = ngx_cpymem(p, access_token->data, access_token->len);
+    ngx_memcpy(p, refresh_token->data, refresh_token->len);
+
+    ngx_rbtree_insert(&shm->sh->rbtree, &sess->node);
+    ngx_queue_insert_head(&shm->sh->queue, &sess->queue);
+
+    ngx_shmtx_unlock(&shm->shpool->mutex);
+
+    return NGX_OK;
+}
+
+
+/*
+ * Copy a stored session into the request pool.  Returns NGX_DECLINED when the
+ * session is unknown or has expired.
+ */
+static ngx_int_t
+ngx_http_oidc_sess_load(ngx_http_request_t *r, ngx_shm_zone_t *zone,
+    ngx_str_t *sid, ngx_str_t *claims, ngx_str_t *id_token,
+    ngx_str_t *access_token, ngx_str_t *refresh_token,
+    time_t *issued, time_t *access_expires, time_t *introspected)
+{
+    ngx_http_oidc_shm_t   *shm = zone->data;
+    ngx_http_oidc_sess_t  *sess;
+    u_char                *buf, *p;
+    size_t                 size;
+    ngx_int_t              rc = NGX_DECLINED;
+
+    ngx_shmtx_lock(&shm->shpool->mutex);
+
+    sess = ngx_http_oidc_sess_lookup(shm->sh, sid);
+
+    if (sess == NULL) {
+        goto done;
+    }
+
+    if (sess->expires <= ngx_time()) {
+        ngx_http_oidc_sess_remove(shm, sess);
+        goto done;
+    }
+
+    size = sess->claims_len + sess->id_token_len + sess->access_token_len
+         + sess->refresh_token_len;
+
+    buf = ngx_pnalloc(r->pool, size ? size : 1);
+    if (buf == NULL) {
+        rc = NGX_ERROR;
+        goto done;
+    }
+
+    ngx_memcpy(buf, sess->data, size);
+
+    p = buf;
+    claims->data = p;        claims->len        = sess->claims_len;
+    p += sess->claims_len;
+    id_token->data = p;      id_token->len      = sess->id_token_len;
+    p += sess->id_token_len;
+    access_token->data = p;  access_token->len  = sess->access_token_len;
+    p += sess->access_token_len;
+    refresh_token->data = p; refresh_token->len = sess->refresh_token_len;
+
+    *issued         = sess->issued;
+    *access_expires = sess->access_expires;
+    *introspected   = sess->introspected;
+
+    /* Refresh the LRU position. */
+    ngx_queue_remove(&sess->queue);
+    ngx_queue_insert_head(&shm->sh->queue, &sess->queue);
+
+    rc = NGX_OK;
+
+done:
+
+    ngx_shmtx_unlock(&shm->shpool->mutex);
+
+    return rc;
+}
+
+
+/*
+ * Record the time of the last successful introspection without rewriting the
+ * whole session (in particular without extending its lifetime).
+ */
+static void
+ngx_http_oidc_sess_touch(ngx_shm_zone_t *zone, ngx_str_t *sid,
+    time_t introspected)
+{
+    ngx_http_oidc_shm_t   *shm = zone->data;
+    ngx_http_oidc_sess_t  *sess;
+
+    ngx_shmtx_lock(&shm->shpool->mutex);
+
+    sess = ngx_http_oidc_sess_lookup(shm->sh, sid);
+    if (sess != NULL) {
+        sess->introspected = introspected;
+    }
+
+    ngx_shmtx_unlock(&shm->shpool->mutex);
+}
+
+
+static void
+ngx_http_oidc_sess_delete(ngx_shm_zone_t *zone, ngx_str_t *sid)
+{
+    ngx_http_oidc_shm_t   *shm = zone->data;
+    ngx_http_oidc_sess_t  *sess;
+
+    ngx_shmtx_lock(&shm->shpool->mutex);
+
+    sess = ngx_http_oidc_sess_lookup(shm->sh, sid);
+    if (sess != NULL) {
+        ngx_http_oidc_sess_remove(shm, sess);
+    }
+
+    ngx_shmtx_unlock(&shm->shpool->mutex);
+}
+
+
+/* ------------------------------------------------------------------------ *
  *  Discovery
  * ------------------------------------------------------------------------ */
 
@@ -1128,6 +1771,8 @@ ngx_http_oidc_parse_discovery_json(ngx_http_request_t *r, ngx_pool_t *pool,
     OIDC_DISCOVERY_FIELD(token_endpoint,        "token_endpoint",         1)
     OIDC_DISCOVERY_FIELD(jwks_uri,              "jwks_uri",               1)
     OIDC_DISCOVERY_FIELD(userinfo_endpoint,     "userinfo_endpoint",      0)
+    OIDC_DISCOVERY_FIELD(end_session_endpoint,  "end_session_endpoint",   0)
+    OIDC_DISCOVERY_FIELD(introspection_endpoint, "introspection_endpoint", 0)
 
 #undef OIDC_DISCOVERY_FIELD
 
@@ -1383,6 +2028,7 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
     ngx_table_elt_t  *location;
     ngx_str_t        *auth_endpoint = &ctx->metadata->authorization_endpoint;
     ngx_str_t         state, nonce, verifier, return_to, esc_return_to;
+    ngx_str_t         extra = ngx_null_string;
     u_char            state_buf[64], nonce_buf[64], verifier_buf[64];
     u_char            challenge[43];
     size_t            challenge_len, len;
@@ -1390,6 +2036,16 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
     ngx_uint_t        has_query;
 
     if (auth_endpoint->len == 0) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /*
+     * oidc_auth_request_args lets a deployment add parameters such as
+     * prompt=select_account or login_hint=... to the authorization request.
+     */
+    if (lcf->auth_args != NULL
+        && ngx_http_complex_value(r, lcf->auth_args, &extra) != NGX_OK)
+    {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -1424,7 +2080,8 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
         + sizeof("&state=") - 1 + state.len
         + sizeof("&nonce=") - 1 + nonce.len
         + sizeof("&code_challenge=") - 1 + challenge_len
-        + sizeof("&code_challenge_method=S256") - 1;
+        + sizeof("&code_challenge_method=S256") - 1
+        + (extra.len ? 1 + extra.len : 0);
 
     location = ngx_list_push(&r->headers_out.headers);
     if (location == NULL) {
@@ -1464,6 +2121,11 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
 
     p = ngx_cpymem(p, "&code_challenge_method=S256",
                    sizeof("&code_challenge_method=S256") - 1);
+
+    if (extra.len) {
+        *p++ = '&';
+        p = ngx_cpymem(p, extra.data, extra.len);
+    }
 
     location->value.len = p - location->value.data;
 
@@ -1523,28 +2185,84 @@ ngx_http_oidc_redirect_to_idp(ngx_http_request_t *r,
  * ------------------------------------------------------------------------ */
 
 /*
- * Build the token request and start the /_oidc_token subrequest.
+ * Append the client credentials to a request body when oidc_client_auth is
+ * "post"; with "basic" they travel in the Authorization header instead.
+ */
+static size_t
+ngx_http_oidc_client_post_len(ngx_http_oidc_loc_conf_t *lcf)
+{
+    return lcf->client_auth_post ? lcf->client_post.len : 0;
+}
+
+
+static u_char *
+ngx_http_oidc_client_post(u_char *p, ngx_http_oidc_loc_conf_t *lcf)
+{
+    if (lcf->client_auth_post && lcf->client_post.len) {
+        p = ngx_cpymem(p, lcf->client_post.data, lcf->client_post.len);
+    }
+
+    return p;
+}
+
+
+/*
+ * Start a subrequest to the token endpoint.
  *
  * The request parameters are published through $oidc_token_body (consumed by
- * proxy_set_body) and the client credentials through $oidc_token_basic
- * (client_secret_basic, RFC 6749 section 2.3.1).  Nothing is passed as
- * subrequest arguments, so neither the authorization code nor the client
- * secret ever reaches a request line, an access log or an error log.
+ * proxy_set_body) and, for client_secret_basic, the credentials through
+ * $oidc_token_basic.  Nothing is passed as subrequest arguments, so neither
+ * the authorization code nor the client secret ever reaches a request line,
+ * an access log or an error log.
  */
 static ngx_int_t
-ngx_http_oidc_start_token_request(ngx_http_request_t *r,
-    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx, ngx_str_t *code)
+ngx_http_oidc_send_token_request(ngx_http_request_t *r,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx, ngx_uint_t phase)
 {
     ngx_http_request_t          *sr;
     ngx_http_post_subrequest_t  *psr;
     ngx_str_t                    uri = ngx_string("/_oidc_token");
-    ngx_str_t                    verifier = ngx_null_string;
-    size_t                       len;
-    u_char                      *p;
 
-    if (lcf->client_basic.len == 0) {
+    ctx->token_basic = lcf->client_auth_post ? (ngx_str_t) ngx_null_string
+                                             : lcf->client_basic;
+    ctx->token_url   = ctx->metadata->token_endpoint;
+    ctx->phase       = phase;
+
+    psr = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
+    if (psr == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    psr->handler = ngx_http_oidc_token_handler;
+    psr->data    = NULL;
+
+    /* A retried step must run its completion handler again. */
+    ctx->token_handled = 0;
+    ctx->jwks_handled  = 0;
+
+    if (ngx_http_subrequest(r, &uri, NULL, &sr, psr,
+                            NGX_HTTP_SUBREQUEST_IN_MEMORY) != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ctx->waiting = 1;
+
+    return NGX_AGAIN;
+}
+
+
+static ngx_int_t
+ngx_http_oidc_start_token_request(ngx_http_request_t *r,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx, ngx_str_t *code)
+{
+    ngx_str_t  verifier = ngx_null_string;
+    size_t     len;
+    u_char    *p;
+
+    if (lcf->client_secret.len == 0) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "OIDC: oidc_client_id/oidc_client_secret are not set");
+                      "OIDC: oidc_client_secret is not set");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -1560,7 +2278,8 @@ ngx_http_oidc_start_token_request(ngx_http_request_t *r,
             + ngx_http_oidc_escaped_len(&lcf->client_id)
         + (verifier.len
            ? sizeof("&code_verifier=") - 1 + ngx_http_oidc_escaped_len(&verifier)
-           : 0);
+           : 0)
+        + ngx_http_oidc_client_post_len(lcf);
 
     ctx->token_body.data = ngx_pnalloc(r->pool, len);
     if (ctx->token_body.data == NULL) {
@@ -1584,51 +2303,121 @@ ngx_http_oidc_start_token_request(ngx_http_request_t *r,
         p = ngx_http_oidc_escape(p, &verifier);
     }
 
+    p = ngx_http_oidc_client_post(p, lcf);
+
     ctx->token_body.len = p - ctx->token_body.data;
-    ctx->token_basic    = lcf->client_basic;
-    ctx->token_url      = ctx->metadata->token_endpoint;
-
-    psr = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
-    if (psr == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    psr->handler = ngx_http_oidc_token_handler;
-    psr->data    = NULL;
-
     ctx->token_attempted = 1;
 
-    if (ngx_http_subrequest(r, &uri, NULL, &sr, psr,
-                            NGX_HTTP_SUBREQUEST_IN_MEMORY) != NGX_OK)
-    {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    ctx->waiting = 1;
-
-    return NGX_AGAIN;
+    return ngx_http_oidc_send_token_request(r, lcf, ctx, OIDC_PHASE_LOGIN);
 }
 
 
 /*
- * Token subrequest completion handler.
+ * Renew the tokens of an existing session with the refresh token
+ * (RFC 6749 section 6).
+ */
+static ngx_int_t
+ngx_http_oidc_start_refresh_request(ngx_http_request_t *r,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx)
+{
+    size_t   len;
+    u_char  *p;
+
+    len = sizeof("grant_type=refresh_token") - 1
+        + sizeof("&refresh_token=") - 1
+            + ngx_http_oidc_escaped_len(&ctx->refresh_token)
+        + sizeof("&client_id=") - 1
+            + ngx_http_oidc_escaped_len(&lcf->client_id)
+        + ngx_http_oidc_client_post_len(lcf);
+
+    ctx->token_body.data = ngx_pnalloc(r->pool, len);
+    if (ctx->token_body.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    p = ngx_cpymem(ctx->token_body.data, "grant_type=refresh_token",
+                   sizeof("grant_type=refresh_token") - 1);
+
+    p = ngx_cpymem(p, "&refresh_token=", sizeof("&refresh_token=") - 1);
+    p = ngx_http_oidc_escape(p, &ctx->refresh_token);
+
+    p = ngx_cpymem(p, "&client_id=", sizeof("&client_id=") - 1);
+    p = ngx_http_oidc_escape(p, &lcf->client_id);
+
+    p = ngx_http_oidc_client_post(p, lcf);
+
+    ctx->token_body.len = p - ctx->token_body.data;
+    ctx->refresh_attempted = 1;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "OIDC: refreshing the access token");
+
+    return ngx_http_oidc_send_token_request(r, lcf, ctx, OIDC_PHASE_REFRESH);
+}
+
+
+/*
+ * A refresh attempt that fails is not an error for the user: the session is
+ * dropped and the request falls back to a full re-authentication.
+ */
+static void
+ngx_http_oidc_refresh_failed(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
+    ngx_http_oidc_main_conf_t *mcf)
+{
+    if (mcf->shm_zone != NULL && ctx->sid.len) {
+        ngx_http_oidc_sess_delete(mcf->shm_zone, &ctx->sid);
+    }
+
+    ctx->waiting = 0;
+    r->write_event_handler = ngx_http_core_run_phases;
+}
+
+
+/*
+ * Write the current tokens and claims back to the store, keeping the same
+ * session id, and hand the browser a cookie with a fresh Max-Age.
+ */
+static ngx_int_t
+ngx_http_oidc_renew_session(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
+    ngx_http_oidc_main_conf_t *mcf, ngx_http_oidc_loc_conf_t *lcf)
+{
+    ngx_str_t  cookie;
+
+    if (ngx_http_oidc_save_session(r, ctx, mcf, lcf, &cookie) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return ngx_http_oidc_add_cookie(r, "oidc_auth", sizeof("oidc_auth") - 1,
+                                    &cookie,
+                                    ngx_http_oidc_session_lifetime(lcf));
+}
+
+
+/*
+ * Token subrequest completion handler.  Serves both the authorization code
+ * grant (login) and the refresh token grant.
  */
 static ngx_int_t
 ngx_http_oidc_token_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
 {
-    ngx_http_request_t   *pr = r->parent;
-    ngx_http_oidc_ctx_t  *ctx;
-    ngx_str_t             body;
-    json_t               *root, *id_token, *access_token;
-    json_error_t          error;
-    ngx_int_t             status = NGX_HTTP_BAD_GATEWAY;
+    ngx_http_request_t        *pr = r->parent;
+    ngx_http_oidc_ctx_t       *ctx;
+    ngx_http_oidc_loc_conf_t  *lcf;
+    ngx_http_oidc_main_conf_t *mcf;
+    ngx_str_t                  body;
+    json_t                    *root, *v;
+    json_error_t               error;
+    ngx_uint_t                 refreshing;
+    ngx_int_t                  status = NGX_HTTP_BAD_GATEWAY;
 
     if (pr == NULL) {
         return NGX_ERROR;
     }
 
     ctx = ngx_http_get_module_ctx(pr, ngx_http_oidc_module);
-    if (ctx == NULL) {
+    lcf = ngx_http_get_module_loc_conf(pr, ngx_http_oidc_module);
+    mcf = ngx_http_get_module_main_conf(pr, ngx_http_oidc_module);
+    if (ctx == NULL || lcf == NULL || mcf == NULL) {
         ngx_http_oidc_finish(pr, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return NGX_OK;
     }
@@ -1638,19 +2427,21 @@ ngx_http_oidc_token_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
     }
     ctx->token_handled = 1;
 
+    refreshing = (ctx->phase == OIDC_PHASE_REFRESH);
+
     if (rc == NGX_ERROR || r->headers_out.status != NGX_HTTP_OK) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        ngx_uint_t level = refreshing ? NGX_LOG_WARN : NGX_LOG_ERR;
+
+        ngx_log_error(level, r->connection->log, 0,
                       "OIDC: token request failed, status: %ui",
                       r->headers_out.status);
-        ngx_http_oidc_finish(pr, NGX_HTTP_BAD_GATEWAY);
-        return NGX_OK;
+        goto failed;
     }
 
     if (ngx_http_oidc_subrequest_body(r, &body) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "OIDC: token response has no body");
-        ngx_http_oidc_finish(pr, NGX_HTTP_BAD_GATEWAY);
-        return NGX_OK;
+        goto failed;
     }
 
     root = json_loadb((const char *) body.data, body.len, 0, &error);
@@ -1660,55 +2451,92 @@ ngx_http_oidc_token_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
         if (root) {
             json_decref(root);
         }
-        ngx_http_oidc_finish(pr, NGX_HTTP_BAD_GATEWAY);
+        goto failed;
+    }
+
+    /* access_token / refresh_token / expires_in are all optional. */
+
+    v = json_object_get(root, "access_token");
+    if (json_is_string(v)) {
+        (void) ngx_http_oidc_str_copy(pr->pool, &ctx->access_token,
+                                      json_string_value(v),
+                                      ngx_strlen(json_string_value(v)));
+    }
+
+    v = json_object_get(root, "refresh_token");
+    if (json_is_string(v)) {
+        (void) ngx_http_oidc_str_copy(pr->pool, &ctx->refresh_token,
+                                      json_string_value(v),
+                                      ngx_strlen(json_string_value(v)));
+    }
+
+    v = json_object_get(root, "expires_in");
+    ctx->access_expires = json_is_integer(v)
+                          ? ngx_time() + (time_t) json_integer_value(v)
+                          : 0;
+
+    v = json_object_get(root, "id_token");
+
+    if (json_is_string(v)) {
+        if (ngx_http_oidc_str_copy(pr->pool, &ctx->id_token,
+                                   json_string_value(v),
+                                   ngx_strlen(json_string_value(v))) != NGX_OK)
+        {
+            json_decref(root);
+            status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto failed;
+        }
+
+        json_decref(root);
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "OIDC: id_token received, fetching JWKS");
+
+        /*
+         * Chain the JWKS subrequest.  ctx->waiting stays set so the parent,
+         * whose phases are re-run as soon as this subrequest is finalised,
+         * keeps waiting instead of finalising the request behind our back.
+         */
+        if (ngx_http_oidc_start_jwks_request(pr) != NGX_OK) {
+            status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto failed;
+        }
+
         return NGX_OK;
     }
 
-    id_token     = json_object_get(root, "id_token");
-    access_token = json_object_get(root, "access_token");
-
-    /* id_token is mandatory; access_token is optional. */
-    if (!json_is_string(id_token)) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "OIDC: token response has no id_token");
-        goto done;
-    }
-
-    if (ngx_http_oidc_str_copy(pr->pool, &ctx->id_token,
-                               json_string_value(id_token),
-                               ngx_strlen(json_string_value(id_token)))
-        != NGX_OK)
-    {
-        status = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        goto done;
-    }
-
-    if (json_is_string(access_token)) {
-        (void) ngx_http_oidc_str_copy(pr->pool, &ctx->access_token,
-                                      json_string_value(access_token),
-                                      ngx_strlen(json_string_value(access_token)));
-    }
-
     json_decref(root);
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "OIDC: id_token received, fetching JWKS");
+    if (!refreshing) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "OIDC: token response has no id_token");
+        goto failed;
+    }
 
     /*
-     * Chain the JWKS subrequest.  ctx->waiting stays set so the parent, whose
-     * phases are re-run as soon as this subrequest is finalised, keeps waiting
-     * instead of finalising the request behind our back.
+     * A refresh response without an ID token is allowed: the claims of the
+     * running session stay as they are and only the tokens are renewed.
      */
-    if (ngx_http_oidc_start_jwks_request(pr) != NGX_OK) {
-        ngx_http_oidc_finish(pr, NGX_HTTP_INTERNAL_SERVER_ERROR);
+    if (ngx_http_oidc_renew_session(pr, ctx, mcf, lcf) != NGX_OK) {
+        goto failed;
     }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "OIDC: tokens refreshed");
+
+    ctx->refreshed = 1;
+    ctx->waiting   = 0;
+    pr->write_event_handler = ngx_http_core_run_phases;
 
     return NGX_OK;
 
-done:
+failed:
 
-    json_decref(root);
-    ngx_http_oidc_finish(pr, status);
+    if (refreshing) {
+        ngx_http_oidc_refresh_failed(pr, ctx, mcf);
+    } else {
+        ngx_http_oidc_finish(pr, status);
+    }
 
     return NGX_OK;
 }
@@ -2006,7 +2834,35 @@ ngx_http_oidc_validate_claims(ngx_http_request_t *r,
         }
     }
 
-    /* ---- nonce ---- */
+    /*
+     * ---- nonce / sub ----
+     *
+     * The nonce belongs to the authorization request, so it is only present
+     * on a login.  An ID token obtained through a refresh must instead keep
+     * the same subject as the session it renews (OIDC Core 12.2).
+     */
+    if (ctx->phase == OIDC_PHASE_REFRESH) {
+
+        v = json_object_get(payload, "sub");
+        if (!json_is_string(v)) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "OIDC: the refreshed ID token has no sub claim");
+            return NGX_DECLINED;
+        }
+
+        s = json_string_value(v);
+        if (ctx->claims.sub.len == 0
+            || ngx_strlen(s) != ctx->claims.sub.len
+            || ngx_strncmp(s, ctx->claims.sub.data, ctx->claims.sub.len) != 0)
+        {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "OIDC: the refreshed ID token has a different sub");
+            return NGX_DECLINED;
+        }
+
+        return NGX_OK;
+    }
+
     (void) ngx_http_oidc_get_cookie(r, "oidc_nonce", sizeof("oidc_nonce") - 1,
                                     &nonce_cookie);
 
@@ -2082,7 +2938,11 @@ ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
     if (ngx_http_oidc_verify_signature(pr, &body, &ctx->id_token, &jwt)
         != NGX_OK)
     {
-        ngx_http_oidc_finish(pr, NGX_HTTP_UNAUTHORIZED);
+        if (ctx->phase == OIDC_PHASE_REFRESH) {
+            ngx_http_oidc_refresh_failed(pr, ctx, mcf);
+        } else {
+            ngx_http_oidc_finish(pr, NGX_HTTP_UNAUTHORIZED);
+        }
         return NGX_OK;
     }
 
@@ -2111,7 +2971,12 @@ ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
 
     if (ngx_http_oidc_validate_claims(pr, lcf, ctx, payload) != NGX_OK) {
         json_decref(payload);
-        ngx_http_oidc_finish(pr, NGX_HTTP_UNAUTHORIZED);
+
+        if (ctx->phase == OIDC_PHASE_REFRESH) {
+            ngx_http_oidc_refresh_failed(pr, ctx, mcf);
+        } else {
+            ngx_http_oidc_finish(pr, NGX_HTTP_UNAUTHORIZED);
+        }
         return NGX_OK;
     }
 
@@ -2120,6 +2985,23 @@ ngx_http_oidc_jwks_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "OIDC: ID token verified");
+
+    if (ctx->phase == OIDC_PHASE_REFRESH) {
+
+        if (ngx_http_oidc_renew_session(pr, ctx, mcf, lcf) != NGX_OK) {
+            ngx_http_oidc_refresh_failed(pr, ctx, mcf);
+            return NGX_OK;
+        }
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "OIDC: tokens refreshed");
+
+        ctx->refreshed = 1;
+        ctx->waiting   = 0;
+        pr->write_event_handler = ngx_http_core_run_phases;
+
+        return NGX_OK;
+    }
 
     if (lcf->oidc_use_userinfo
         && ctx->access_token.len > 0
@@ -2299,133 +3181,196 @@ issue:
  * parser.  The payload is capped at OIDC_SESSION_MAX_PAYLOAD bytes to stay
  * within the browser's 4096 byte cookie limit.
  */
-static void
-ngx_http_oidc_issue_session_and_redirect(ngx_http_request_t *r,
-    ngx_http_oidc_ctx_t *ctx, ngx_http_oidc_main_conf_t *mcf)
+/*
+ * Generate a 256 bit session id for the shared memory store.
+ */
+static ngx_int_t
+ngx_http_oidc_new_sid(ngx_http_request_t *r, ngx_str_t *sid)
 {
-    ngx_http_oidc_loc_conf_t     *lcf;
-    ngx_http_oidc_claim_entry_t  *entries;
-    ngx_str_t                     sub_b64, email_b64, name_b64, payload, cookie;
-    ngx_str_t                     return_to, decoded;
-    ngx_table_elt_t              *location;
-    u_char                       *p, *buf;
-    u_char                        mac[32], mac_hex[64];
-    unsigned int                  mac_len;
-    size_t                        len, i;
+    sid->data = ngx_pnalloc(r->pool, 64);
+    if (sid->data == NULL) {
+        return NGX_ERROR;
+    }
 
-    lcf = ngx_http_get_module_loc_conf(r, ngx_http_oidc_module);
+    if (ngx_http_oidc_random_hex(sid->data, 32) != NGX_OK) {
+        return NGX_ERROR;
+    }
 
-    if (mcf == NULL || !mcf->secret_initialized) {
+    sid->len = 64;
+
+    return NGX_OK;
+}
+
+
+/*
+ * How long a session may live.  oidc_session_timeout 0 disables the check, but
+ * the shared memory store still needs an upper bound to reclaim entries.
+ */
+static time_t
+ngx_http_oidc_session_lifetime(ngx_http_oidc_loc_conf_t *lcf)
+{
+    return lcf->session_timeout > 0 ? lcf->session_timeout : 12 * 60 * 60;
+}
+
+
+/*
+ * Persist the session and build the value of the oidc_auth cookie.
+ *
+ * Without oidc_session_store the cookie carries the claims themselves,
+ * authenticated with HMAC-SHA256:
+ *
+ *   oidc_auth = HMAC_HEX(64) || B64(sub):B64(email):B64(name):issued[|...]
+ *
+ * With the store enabled the cookie carries only the session id and the
+ * claims and tokens stay in shared memory.
+ */
+static ngx_int_t
+ngx_http_oidc_save_session(ngx_http_request_t *r, ngx_http_oidc_ctx_t *ctx,
+    ngx_http_oidc_main_conf_t *mcf, ngx_http_oidc_loc_conf_t *lcf,
+    ngx_str_t *cookie)
+{
+    ngx_str_t     claims;
+    time_t        now = ngx_time();
+    u_char       *p;
+    u_char        mac[32], mac_hex[64];
+    unsigned int  mac_len;
+
+    if (ngx_http_oidc_build_claims(r, ctx, now, &claims) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (mcf->shm_zone != NULL) {
+
+        if (ctx->sid.len == 0
+            && ngx_http_oidc_new_sid(r, &ctx->sid) != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        if (ngx_http_oidc_sess_store(r, mcf->shm_zone, &ctx->sid, &claims,
+                                     &ctx->id_token, &ctx->access_token,
+                                     &ctx->refresh_token, now,
+                                     now + ngx_http_oidc_session_lifetime(lcf),
+                                     ctx->access_expires, ctx->introspected)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        *cookie = ctx->sid;
+
+        return NGX_OK;
+    }
+
+    if (!mcf->secret_initialized) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "OIDC: the session cookie secret is not initialised");
-        ngx_http_oidc_finish(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
+        return NGX_ERROR;
     }
-
-    sub_b64.len   = ngx_base64_encoded_length(ctx->claims.sub.len);
-    email_b64.len = ngx_base64_encoded_length(ctx->claims.email.len);
-    name_b64.len  = ngx_base64_encoded_length(ctx->claims.name.len);
-
-    sub_b64.data   = ngx_pnalloc(r->pool, sub_b64.len);
-    email_b64.data = ngx_pnalloc(r->pool, email_b64.len);
-    name_b64.data  = ngx_pnalloc(r->pool, name_b64.len);
-
-    if (sub_b64.data == NULL || email_b64.data == NULL
-        || name_b64.data == NULL)
-    {
-        ngx_http_oidc_finish(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    }
-
-    ngx_encode_base64(&sub_b64,   &ctx->claims.sub);
-    ngx_encode_base64(&email_b64, &ctx->claims.email);
-    ngx_encode_base64(&name_b64,  &ctx->claims.name);
-
-    len = sub_b64.len + email_b64.len + name_b64.len + 3 + NGX_TIME_T_LEN;
-
-    if (ctx->extra_claims != NULL) {
-        entries = ctx->extra_claims->elts;
-        for (i = 0; i < ctx->extra_claims->nelts; i++) {
-            len += 2 + ngx_base64_encoded_length(entries[i].key.len)
-                     + ngx_base64_encoded_length(entries[i].value.len);
-        }
-    }
-
-    buf = ngx_pnalloc(r->pool, len);
-    if (buf == NULL) {
-        ngx_http_oidc_finish(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    }
-
-    p = ngx_snprintf(buf, len, "%V:%V:%V:%T", &sub_b64, &email_b64, &name_b64,
-                     ngx_time());
-
-    if (ctx->extra_claims != NULL) {
-        entries = ctx->extra_claims->elts;
-
-        for (i = 0; i < ctx->extra_claims->nelts; i++) {
-            ngx_str_t kb64, vb64;
-            size_t    need;
-
-            kb64.len = ngx_base64_encoded_length(entries[i].key.len);
-            vb64.len = ngx_base64_encoded_length(entries[i].value.len);
-            need     = 2 + kb64.len + vb64.len;
-
-            if ((size_t) (p - buf) + need > OIDC_SESSION_MAX_PAYLOAD) {
-                ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                              "OIDC: session cookie budget exhausted, "
-                              "claim \"%V\" was dropped", &entries[i].key);
-                continue;
-            }
-
-            kb64.data = ngx_pnalloc(r->pool, kb64.len);
-            vb64.data = ngx_pnalloc(r->pool, vb64.len);
-            if (kb64.data == NULL || vb64.data == NULL) {
-                break;
-            }
-
-            ngx_encode_base64(&kb64, &entries[i].key);
-            ngx_encode_base64(&vb64, &entries[i].value);
-
-            *p++ = '|';
-            p = ngx_cpymem(p, kb64.data, kb64.len);
-            *p++ = ':';
-            p = ngx_cpymem(p, vb64.data, vb64.len);
-        }
-    }
-
-    payload.data = buf;
-    payload.len  = p - buf;
 
     HMAC(EVP_sha256(), mcf->hmac_secret, sizeof(mcf->hmac_secret),
-         payload.data, payload.len, mac, &mac_len);
+         claims.data, claims.len, mac, &mac_len);
     ngx_hex_dump(mac_hex, mac, sizeof(mac));
 
-    cookie.len  = sizeof(mac_hex) + payload.len;
-    cookie.data = ngx_pnalloc(r->pool, cookie.len);
-    if (cookie.data == NULL) {
-        ngx_http_oidc_finish(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+    cookie->len  = sizeof(mac_hex) + claims.len;
+    cookie->data = ngx_pnalloc(r->pool, cookie->len);
+    if (cookie->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_cpymem(cookie->data, mac_hex, sizeof(mac_hex));
+    ngx_memcpy(p, claims.data, claims.len);
+
+    return NGX_OK;
+}
+
+
+/*
+ * Work out where to send the browser after a successful login.  Only local
+ * paths are accepted: "//host" and "/\host" are absolute references to another
+ * origin and would turn the callback into an open redirect.
+ */
+static void
+ngx_http_oidc_set_return_to(ngx_http_request_t *r, ngx_table_elt_t *location)
+{
+    ngx_str_t  return_to = ngx_null_string;
+    ngx_str_t  decoded;
+    u_char    *src, *dst;
+    size_t     i;
+
+    ngx_str_set(&location->value, "/");
+
+    (void) ngx_http_oidc_get_cookie(r, "oidc_return_to",
+                                    sizeof("oidc_return_to") - 1, &return_to);
+
+    if (return_to.len == 0 || return_to.len > OIDC_RETURN_TO_MAX) {
         return;
     }
 
-    p = ngx_cpymem(cookie.data, mac_hex, sizeof(mac_hex));
-    ngx_memcpy(p, payload.data, payload.len);
+    decoded.data = ngx_pnalloc(r->pool, return_to.len + 1);
+    if (decoded.data == NULL) {
+        return;
+    }
 
-    if (ngx_http_oidc_add_cookie(r, "oidc_auth", sizeof("oidc_auth") - 1,
-                                 &cookie, lcf->session_timeout) != NGX_OK)
+    src = return_to.data;
+    dst = decoded.data;
+    ngx_unescape_uri(&dst, &src, return_to.len, 0);
+    decoded.len = dst - decoded.data;
+    decoded.data[decoded.len] = '\0';
+
+    if (decoded.len == 0
+        || decoded.data[0] != '/'
+        || (decoded.len > 1
+            && (decoded.data[1] == '/' || decoded.data[1] == '\\')))
     {
-        ngx_http_oidc_finish(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
 
-    /* The login transaction is over: drop its cookies. */
+    for (i = 0; i < decoded.len; i++) {
+        if (decoded.data[i] < 0x20 || decoded.data[i] > 0x7e) {
+            return;
+        }
+    }
+
+    location->value = decoded;
+}
+
+
+static void
+ngx_http_oidc_clear_transaction_cookies(ngx_http_request_t *r)
+{
     (void) ngx_http_oidc_clear_cookie(r, "oidc_state" OIDC_COOKIE_EXPIRED);
     (void) ngx_http_oidc_clear_cookie(r, "oidc_nonce" OIDC_COOKIE_EXPIRED);
     (void) ngx_http_oidc_clear_cookie(r, "oidc_return_to" OIDC_COOKIE_EXPIRED);
     (void) ngx_http_oidc_clear_cookie(r,
                                       "oidc_pkce_verifier" OIDC_COOKIE_EXPIRED);
+}
 
-    /* ---- redirect back to the originally requested URI ---- */
+
+static void
+ngx_http_oidc_issue_session_and_redirect(ngx_http_request_t *r,
+    ngx_http_oidc_ctx_t *ctx, ngx_http_oidc_main_conf_t *mcf)
+{
+    ngx_http_oidc_loc_conf_t  *lcf;
+    ngx_table_elt_t           *location;
+    ngx_str_t                  cookie;
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_oidc_module);
+
+    if (ngx_http_oidc_save_session(r, ctx, mcf, lcf, &cookie) != NGX_OK) {
+        ngx_http_oidc_finish(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    if (ngx_http_oidc_add_cookie(r, "oidc_auth", sizeof("oidc_auth") - 1,
+                                 &cookie,
+                                 ngx_http_oidc_session_lifetime(lcf)) != NGX_OK)
+    {
+        ngx_http_oidc_finish(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ngx_http_oidc_clear_transaction_cookies(r);
 
     location = ngx_list_push(&r->headers_out.headers);
     if (location == NULL) {
@@ -2435,48 +3380,7 @@ ngx_http_oidc_issue_session_and_redirect(ngx_http_request_t *r,
 
     location->hash = 1;
     ngx_str_set(&location->key, "Location");
-    ngx_str_set(&location->value, "/");
-
-    return_to = (ngx_str_t) ngx_null_string;
-    (void) ngx_http_oidc_get_cookie(r, "oidc_return_to",
-                                    sizeof("oidc_return_to") - 1, &return_to);
-
-    if (return_to.len > 0 && return_to.len <= OIDC_RETURN_TO_MAX) {
-        u_char *src = return_to.data;
-        u_char *dst;
-
-        decoded.data = ngx_pnalloc(r->pool, return_to.len + 1);
-        if (decoded.data != NULL) {
-            dst = decoded.data;
-            ngx_unescape_uri(&dst, &src, return_to.len, 0);
-            decoded.len = dst - decoded.data;
-            decoded.data[decoded.len] = '\0';
-
-            /*
-             * Only local paths are acceptable.  "//host" and "/\host" are
-             * rejected because browsers treat them as absolute references to
-             * another origin (open redirect).
-             */
-            if (decoded.len > 0
-                && decoded.data[0] == '/'
-                && !(decoded.len > 1
-                     && (decoded.data[1] == '/' || decoded.data[1] == '\\')))
-            {
-                ngx_uint_t ok = 1;
-
-                for (i = 0; i < decoded.len; i++) {
-                    if (decoded.data[i] < 0x20 || decoded.data[i] > 0x7e) {
-                        ok = 0;
-                        break;
-                    }
-                }
-
-                if (ok) {
-                    location->value = decoded;
-                }
-            }
-        }
-    }
+    ngx_http_oidc_set_return_to(r, location);
 
     r->headers_out.status   = NGX_HTTP_MOVED_TEMPORARILY;
     r->headers_out.location = location;
@@ -2486,78 +3390,77 @@ ngx_http_oidc_issue_session_and_redirect(ngx_http_request_t *r,
 
 
 /*
- * Verify the oidc_auth cookie and restore the claims it carries.
+ * Validate the oidc_auth cookie and restore everything it refers to.
  *
- * Returns NGX_OK when the session is valid and not expired.
+ * Returns NGX_OK when the session is valid and has not expired.
  */
 static ngx_int_t
 ngx_http_oidc_verify_session(ngx_http_request_t *r,
     ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_main_conf_t *mcf,
     ngx_http_oidc_ctx_t *ctx)
 {
-    ngx_str_t   cookie = ngx_null_string;
-    ngx_str_t   payload, enc, dec;
-    u_char     *pl, *end, *c1, *c2, *c3, *ts_end, *pipe, *ep;
-    u_char      mac[32], mac_hex[64];
-    unsigned int mac_len;
-    time_t      issued, now;
-    ngx_str_t  *field[3];
-    ngx_uint_t  i;
-
-    if (mcf == NULL || !mcf->secret_initialized) {
-        return NGX_DECLINED;
-    }
+    ngx_str_t     cookie = ngx_null_string;
+    ngx_str_t     claims;
+    time_t        issued, now;
+    u_char        mac[32], mac_hex[64];
+    unsigned int  mac_len;
 
     if (ngx_http_oidc_get_cookie(r, "oidc_auth", sizeof("oidc_auth") - 1,
-                                 &cookie) != NGX_OK
-        || cookie.len <= sizeof(mac_hex))
+                                 &cookie) != NGX_OK)
     {
         return NGX_DECLINED;
     }
 
-    payload.data = cookie.data + sizeof(mac_hex);
-    payload.len  = cookie.len - sizeof(mac_hex);
+    /* This runs again after a refresh, so start from a clean slate. */
+    ngx_memzero(&ctx->claims, sizeof(ngx_http_oidc_claims_t));
+    ctx->extra_claims = NULL;
 
-    HMAC(EVP_sha256(), mcf->hmac_secret, sizeof(mcf->hmac_secret),
-         payload.data, payload.len, mac, &mac_len);
-    ngx_hex_dump(mac_hex, mac, sizeof(mac));
+    if (mcf->shm_zone != NULL) {
 
-    if (CRYPTO_memcmp(cookie.data, mac_hex, sizeof(mac_hex)) != 0) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "OIDC: session cookie signature mismatch");
-        return NGX_DECLINED;
+        if (cookie.len != 64) {
+            return NGX_DECLINED;
+        }
+
+        if (ngx_http_oidc_sess_load(r, mcf->shm_zone, &cookie, &claims,
+                                    &ctx->id_token, &ctx->access_token,
+                                    &ctx->refresh_token, &issued,
+                                    &ctx->access_expires, &ctx->introspected)
+            != NGX_OK)
+        {
+            return NGX_DECLINED;
+        }
+
+        ctx->sid = cookie;
+
+    } else {
+
+        if (!mcf->secret_initialized || cookie.len <= sizeof(mac_hex)) {
+            return NGX_DECLINED;
+        }
+
+        claims.data = cookie.data + sizeof(mac_hex);
+        claims.len  = cookie.len - sizeof(mac_hex);
+
+        HMAC(EVP_sha256(), mcf->hmac_secret, sizeof(mcf->hmac_secret),
+             claims.data, claims.len, mac, &mac_len);
+        ngx_hex_dump(mac_hex, mac, sizeof(mac));
+
+        if (CRYPTO_memcmp(cookie.data, mac_hex, sizeof(mac_hex)) != 0) {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "OIDC: session cookie signature mismatch");
+            return NGX_DECLINED;
+        }
     }
 
-    pl  = payload.data;
-    end = payload.data + payload.len;
-
-    c1 = ngx_strlchr(pl, end, ':');
-    if (c1 == NULL) {
-        return NGX_DECLINED;
-    }
-    c2 = ngx_strlchr(c1 + 1, end, ':');
-    if (c2 == NULL) {
-        return NGX_DECLINED;
-    }
-    c3 = ngx_strlchr(c2 + 1, end, ':');
-    if (c3 == NULL) {
-        return NGX_DECLINED;
-    }
-
-    /* ---- issued_at: the session must not outlive oidc_session_timeout ---- */
-
-    pipe   = ngx_strlchr(c3 + 1, end, '|');
-    ts_end = pipe ? pipe : end;
-
-    issued = ngx_atotm(c3 + 1, ts_end - (c3 + 1));
-    if (issued == NGX_ERROR) {
+    if (ngx_http_oidc_parse_claims(r, ctx, &claims, &issued) != NGX_OK) {
         return NGX_DECLINED;
     }
 
     now = ngx_time();
+
     if (issued > now + OIDC_CLOCK_SKEW) {
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "OIDC: session cookie is issued in the future");
+                      "OIDC: the session was issued in the future");
         return NGX_DECLINED;
     }
 
@@ -2567,86 +3470,270 @@ ngx_http_oidc_verify_session(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
-    /* ---- fixed claims ---- */
+    return NGX_OK;
+}
 
-    field[0] = &ctx->claims.sub;
-    field[1] = &ctx->claims.email;
-    field[2] = &ctx->claims.name;
 
-    enc.data = pl;
-    enc.len  = c1 - pl;
+/* ------------------------------------------------------------------------ *
+ *  Token introspection (RFC 7662)
+ * ------------------------------------------------------------------------ */
 
-    for (i = 0; i < 3; i++) {
-        if (i == 1) {
-            enc.data = c1 + 1;
-            enc.len  = c2 - (c1 + 1);
-        } else if (i == 2) {
-            enc.data = c2 + 1;
-            enc.len  = c3 - (c2 + 1);
-        }
+static ngx_int_t ngx_http_oidc_introspect_handler(ngx_http_request_t *r,
+    void *data, ngx_int_t rc);
 
-        dec.data = ngx_pnalloc(r->pool, ngx_base64_decoded_length(enc.len));
-        if (dec.data == NULL) {
-            return NGX_DECLINED;
-        }
 
-        if (ngx_decode_base64(&dec, &enc) == NGX_OK) {
-            *field[i] = dec;
-        }
+static ngx_int_t
+ngx_http_oidc_start_introspect_request(ngx_http_request_t *r,
+    ngx_http_oidc_loc_conf_t *lcf, ngx_http_oidc_ctx_t *ctx)
+{
+    ngx_http_request_t          *sr;
+    ngx_http_post_subrequest_t  *psr;
+    ngx_str_t                    uri = ngx_string("/_oidc_introspect");
+    size_t                       len;
+    u_char                      *p;
+
+    len = sizeof("token=") - 1 + ngx_http_oidc_escaped_len(&ctx->access_token)
+        + sizeof("&token_type_hint=access_token") - 1
+        + sizeof("&client_id=") - 1 + ngx_http_oidc_escaped_len(&lcf->client_id)
+        + ngx_http_oidc_client_post_len(lcf);
+
+    ctx->introspect_body.data = ngx_pnalloc(r->pool, len);
+    if (ctx->introspect_body.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    /* ---- arbitrary claims ---- */
+    p = ngx_cpymem(ctx->introspect_body.data, "token=", sizeof("token=") - 1);
+    p = ngx_http_oidc_escape(p, &ctx->access_token);
+    p = ngx_cpymem(p, "&token_type_hint=access_token",
+                   sizeof("&token_type_hint=access_token") - 1);
+    p = ngx_cpymem(p, "&client_id=", sizeof("&client_id=") - 1);
+    p = ngx_http_oidc_escape(p, &lcf->client_id);
+    p = ngx_http_oidc_client_post(p, lcf);
 
-    if (pipe != NULL) {
-        ep = pipe + 1;
+    ctx->introspect_body.len = p - ctx->introspect_body.data;
+    ctx->introspect_url      = ctx->metadata->introspection_endpoint;
+    ctx->token_basic         = lcf->client_auth_post
+                               ? (ngx_str_t) ngx_null_string
+                               : lcf->client_basic;
 
-        while (ep < end) {
-            u_char    *next = ngx_strlchr(ep, end, '|');
-            u_char    *stop = next ? next : end;
-            u_char    *colon = ngx_strlchr(ep, stop, ':');
-            ngx_str_t  kenc, venc, kdec, vdec;
-
-            if (colon != NULL) {
-                kenc.data = ep;
-                kenc.len  = colon - ep;
-                venc.data = colon + 1;
-                venc.len  = stop - (colon + 1);
-
-                kdec.data = ngx_pnalloc(r->pool,
-                                        ngx_base64_decoded_length(kenc.len) + 1);
-                vdec.data = ngx_pnalloc(r->pool,
-                                        ngx_base64_decoded_length(venc.len) + 1);
-
-                if (kdec.data != NULL && vdec.data != NULL
-                    && ngx_decode_base64(&kdec, &kenc) == NGX_OK
-                    && ngx_decode_base64(&vdec, &venc) == NGX_OK)
-                {
-                    kdec.data[kdec.len] = '\0';
-
-                    if (ctx->extra_claims == NULL) {
-                        ctx->extra_claims = ngx_array_create(r->pool, 8,
-                                       sizeof(ngx_http_oidc_claim_entry_t));
-                    }
-
-                    if (ctx->extra_claims != NULL) {
-                        ngx_http_oidc_claim_entry_t *entry =
-                            ngx_array_push(ctx->extra_claims);
-                        if (entry != NULL) {
-                            entry->key   = kdec;
-                            entry->value = vdec;
-                        }
-                    }
-                }
-            }
-
-            if (next == NULL) {
-                break;
-            }
-            ep = next + 1;
-        }
+    psr = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
+    if (psr == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
+
+    psr->handler = ngx_http_oidc_introspect_handler;
+    psr->data    = NULL;
+
+    ctx->introspect_attempted = 1;
+
+    if (ngx_http_subrequest(r, &uri, NULL, &sr, psr,
+                            NGX_HTTP_SUBREQUEST_IN_MEMORY) != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ctx->waiting = 1;
+
+    return NGX_AGAIN;
+}
+
+
+/*
+ * Introspection completion handler.
+ *
+ * "active": false means the token was revoked at the IdP, so the session is
+ * dropped and the request falls back to re-authentication.  A failure to
+ * reach the introspection endpoint is not treated as a revocation: it is
+ * logged and the session is left alone, and the check is retried on the next
+ * request because the timestamp is not updated.
+ */
+static ngx_int_t
+ngx_http_oidc_introspect_handler(ngx_http_request_t *r, void *data,
+    ngx_int_t rc)
+{
+    ngx_http_request_t         *pr = r->parent;
+    ngx_http_oidc_ctx_t        *ctx;
+    ngx_http_oidc_main_conf_t  *mcf;
+    ngx_str_t                   body;
+    json_t                     *root, *active;
+    json_error_t                jerr;
+
+    if (pr == NULL) {
+        return NGX_ERROR;
+    }
+
+    ctx = ngx_http_get_module_ctx(pr, ngx_http_oidc_module);
+    mcf = ngx_http_get_module_main_conf(pr, ngx_http_oidc_module);
+    if (ctx == NULL || mcf == NULL) {
+        ngx_http_oidc_finish(pr, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_OK;
+    }
+
+    if (ctx->introspect_handled || ctx->done) {
+        return rc;
+    }
+    ctx->introspect_handled = 1;
+
+    if (rc == NGX_ERROR || r->headers_out.status != NGX_HTTP_OK) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "OIDC: introspection request failed, status: %ui",
+                      r->headers_out.status);
+        goto resume;
+    }
+
+    if (ngx_http_oidc_subrequest_body(r, &body) != NGX_OK) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "OIDC: introspection response has no body");
+        goto resume;
+    }
+
+    root = json_loadb((const char *) body.data, body.len, 0, &jerr);
+    if (root == NULL || !json_is_object(root)) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "OIDC: introspection JSON parse error: %s", jerr.text);
+        if (root) {
+            json_decref(root);
+        }
+        goto resume;
+    }
+
+    active = json_object_get(root, "active");
+
+    if (json_is_true(active)) {
+        ctx->introspected = ngx_time();
+
+        if (mcf->shm_zone != NULL && ctx->sid.len) {
+            ngx_http_oidc_sess_touch(mcf->shm_zone, &ctx->sid,
+                                     ctx->introspected);
+        }
+
+        json_decref(root);
+        goto resume;
+    }
+
+    json_decref(root);
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                  "OIDC: the access token is no longer active, "
+                  "dropping the session");
+
+    if (mcf->shm_zone != NULL && ctx->sid.len) {
+        ngx_http_oidc_sess_delete(mcf->shm_zone, &ctx->sid);
+    }
+
+resume:
+
+    ctx->waiting = 0;
+    pr->write_event_handler = ngx_http_core_run_phases;
 
     return NGX_OK;
+}
+
+
+/* ------------------------------------------------------------------------ *
+ *  RP-Initiated Logout
+ * ------------------------------------------------------------------------ */
+
+/*
+ * Drop the session and send the browser to the IdP's end_session_endpoint so
+ * that the login session is terminated there as well.  Without such an
+ * endpoint the local session is still cleared and the browser is sent to
+ * oidc_post_logout_redirect_uri.
+ */
+static ngx_int_t
+ngx_http_oidc_logout(ngx_http_request_t *r, ngx_http_oidc_loc_conf_t *lcf,
+    ngx_http_oidc_main_conf_t *mcf, ngx_http_oidc_ctx_t *ctx)
+{
+    ngx_table_elt_t  *location;
+    ngx_str_t        *endpoint;
+    size_t            len;
+    u_char           *p;
+    ngx_uint_t        has_query;
+
+    /* Loading the session gives us the ID token to use as id_token_hint. */
+    (void) ngx_http_oidc_verify_session(r, lcf, mcf, ctx);
+
+    if (mcf->shm_zone != NULL && ctx->sid.len) {
+        ngx_http_oidc_sess_delete(mcf->shm_zone, &ctx->sid);
+    }
+
+    if (ngx_http_oidc_clear_cookie(r, "oidc_auth" OIDC_COOKIE_EXPIRED)
+        != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_http_oidc_clear_transaction_cookies(r);
+
+    location = ngx_list_push(&r->headers_out.headers);
+    if (location == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    location->hash = 1;
+    ngx_str_set(&location->key, "Location");
+
+    endpoint = &ctx->metadata->end_session_endpoint;
+
+    if (endpoint->len == 0) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "OIDC: the provider advertises no end_session_endpoint, "
+                      "only the local session was cleared");
+
+        if (lcf->post_logout_redirect_uri.len) {
+            location->value = lcf->post_logout_redirect_uri;
+        } else {
+            ngx_str_set(&location->value, "/");
+        }
+
+        r->headers_out.status   = NGX_HTTP_MOVED_TEMPORARILY;
+        r->headers_out.location = location;
+
+        return NGX_HTTP_MOVED_TEMPORARILY;
+    }
+
+    has_query = (ngx_strlchr(endpoint->data, endpoint->data + endpoint->len,
+                             '?') != NULL);
+
+    len = endpoint->len + 1
+        + sizeof("client_id=") - 1 + ngx_http_oidc_escaped_len(&lcf->client_id)
+        + (ctx->id_token.len
+           ? sizeof("&id_token_hint=") - 1
+             + ngx_http_oidc_escaped_len(&ctx->id_token)
+           : 0)
+        + (lcf->post_logout_redirect_uri.len
+           ? sizeof("&post_logout_redirect_uri=") - 1
+             + ngx_http_oidc_escaped_len(&lcf->post_logout_redirect_uri)
+           : 0);
+
+    location->value.data = ngx_pnalloc(r->pool, len);
+    if (location->value.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    p = ngx_cpymem(location->value.data, endpoint->data, endpoint->len);
+    *p++ = has_query ? '&' : '?';
+
+    p = ngx_cpymem(p, "client_id=", sizeof("client_id=") - 1);
+    p = ngx_http_oidc_escape(p, &lcf->client_id);
+
+    if (ctx->id_token.len) {
+        p = ngx_cpymem(p, "&id_token_hint=", sizeof("&id_token_hint=") - 1);
+        p = ngx_http_oidc_escape(p, &ctx->id_token);
+    }
+
+    if (lcf->post_logout_redirect_uri.len) {
+        p = ngx_cpymem(p, "&post_logout_redirect_uri=",
+                       sizeof("&post_logout_redirect_uri=") - 1);
+        p = ngx_http_oidc_escape(p, &lcf->post_logout_redirect_uri);
+    }
+
+    location->value.len = p - location->value.data;
+
+    r->headers_out.status   = NGX_HTTP_MOVED_TEMPORARILY;
+    r->headers_out.location = location;
+
+    return NGX_HTTP_MOVED_TEMPORARILY;
 }
 
 
@@ -2819,6 +3906,16 @@ ngx_http_oidc_access_handler(ngx_http_request_t *r)
         }
     }
 
+    /* ---- logout ---- */
+
+    if (lcf->logout_path.len
+        && r->uri.len == lcf->logout_path.len
+        && ngx_strncmp(r->uri.data, lcf->logout_path.data,
+                       lcf->logout_path.len) == 0)
+    {
+        return ngx_http_oidc_logout(r, lcf, mcf, ctx);
+    }
+
     /* ---- callback ---- */
 
     if (r->uri.len == lcf->callback_path.len
@@ -2831,6 +3928,33 @@ ngx_http_oidc_access_handler(ngx_http_request_t *r)
     /* ---- existing session ---- */
 
     if (ngx_http_oidc_verify_session(r, lcf, mcf, ctx) == NGX_OK) {
+
+        /*
+         * Refreshing and introspection both need the tokens, which only the
+         * shared memory store keeps beyond the login request.
+         */
+        if (mcf->shm_zone != NULL) {
+
+            if (lcf->refresh_token
+                && !ctx->refresh_attempted
+                && ctx->refresh_token.len > 0
+                && ctx->access_expires > 0
+                && ctx->access_expires <= ngx_time() + OIDC_CLOCK_SKEW)
+            {
+                return ngx_http_oidc_start_refresh_request(r, lcf, ctx);
+            }
+
+            if (lcf->introspection
+                && !ctx->introspect_attempted
+                && ctx->access_token.len > 0
+                && ctx->metadata->introspection_endpoint.len > 0
+                && ngx_time() - ctx->introspected
+                   >= lcf->introspection_interval)
+            {
+                return ngx_http_oidc_start_introspect_request(r, lcf, ctx);
+            }
+        }
+
         return NGX_DECLINED;
     }
 
@@ -2964,22 +4088,26 @@ ngx_http_oidc_create_loc_conf(ngx_conf_t *cf)
     conf->oidc_use_userinfo = NGX_CONF_UNSET;
     conf->session_timeout   = NGX_CONF_UNSET;
     conf->session_claims    = NGX_CONF_UNSET_PTR;
+    conf->client_auth_post  = NGX_CONF_UNSET_UINT;
+    conf->refresh_token     = NGX_CONF_UNSET;
+    conf->introspection     = NGX_CONF_UNSET;
+    conf->introspection_interval = NGX_CONF_UNSET;
+    conf->auth_args         = NGX_CONF_UNSET_PTR;
 
     return conf;
 }
 
 
 /*
- * Derive the local path of the callback from oidc_redirect_uri, which may be
- * either a path or an absolute URI.
+ * Derive the local path from a configured URI, which may be either a path or
+ * an absolute URI.
  */
 static void
-ngx_http_oidc_set_callback_path(ngx_http_oidc_loc_conf_t *conf)
+ngx_http_oidc_uri_path(ngx_str_t *uri, ngx_str_t *path)
 {
-    ngx_str_t  *uri = &conf->redirect_uri;
-    u_char     *p, *end, *q;
+    u_char  *p, *end, *q;
 
-    conf->callback_path = *uri;
+    *path = *uri;
 
     if (uri->len == 0) {
         return;
@@ -2987,7 +4115,9 @@ ngx_http_oidc_set_callback_path(ngx_http_oidc_loc_conf_t *conf)
 
     end = uri->data + uri->len;
 
-    if (uri->len > 7 && ngx_strncasecmp(uri->data, (u_char *) "http://", 7) == 0) {
+    if (uri->len > 7
+        && ngx_strncasecmp(uri->data, (u_char *) "http://", 7) == 0)
+    {
         p = ngx_strlchr(uri->data + 7, end, '/');
 
     } else if (uri->len > 8
@@ -3000,18 +4130,17 @@ ngx_http_oidc_set_callback_path(ngx_http_oidc_loc_conf_t *conf)
     }
 
     if (p == NULL) {
-        ngx_str_set(&conf->callback_path, "/");
+        ngx_str_set(path, "/");
         return;
     }
 
-    conf->callback_path.data = p;
-    conf->callback_path.len  = end - p;
+    path->data = p;
+    path->len  = end - p;
 
-    /* Drop a query string or fragment if the redirect URI carries one. */
-    q = ngx_strlchr(conf->callback_path.data,
-                    conf->callback_path.data + conf->callback_path.len, '?');
+    /* Drop a query string or fragment if the URI carries one. */
+    q = ngx_strlchr(path->data, path->data + path->len, '?');
     if (q != NULL) {
-        conf->callback_path.len = q - conf->callback_path.data;
+        path->len = q - path->data;
     }
 }
 
@@ -3028,6 +4157,7 @@ ngx_http_oidc_set_client_basic(ngx_conf_t *cf, ngx_http_oidc_loc_conf_t *conf)
     size_t     len;
 
     ngx_str_null(&conf->client_basic);
+    ngx_str_null(&conf->client_post);
 
     if (conf->client_id.len == 0 || conf->client_secret.len == 0) {
         return NGX_OK;
@@ -3059,6 +4189,25 @@ ngx_http_oidc_set_client_basic(ngx_conf_t *cf, ngx_http_oidc_loc_conf_t *conf)
     conf->client_basic.data = p - (sizeof("Basic ") - 1);
     conf->client_basic.len  = sizeof("Basic ") - 1 + b64.len;
 
+    /*
+     * client_secret_post: the secret goes into the body.  client_id is always
+     * part of the body, so only the secret is added here — sending client_id
+     * twice would make a strict token endpoint reject the request.
+     */
+    len = sizeof("&client_secret=") - 1
+        + ngx_http_oidc_escaped_len(&conf->client_secret);
+
+    conf->client_post.data = ngx_pnalloc(cf->pool, len);
+    if (conf->client_post.data == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_cpymem(conf->client_post.data, "&client_secret=",
+                   sizeof("&client_secret=") - 1);
+    p = ngx_http_oidc_escape(p, &conf->client_secret);
+
+    conf->client_post.len = p - conf->client_post.data;
+
     return NGX_OK;
 }
 
@@ -3078,8 +4227,18 @@ ngx_http_oidc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->oidc_use_userinfo, prev->oidc_use_userinfo, 0);
     ngx_conf_merge_sec_value(conf->session_timeout, prev->session_timeout, 3600);
     ngx_conf_merge_ptr_value(conf->session_claims, prev->session_claims, NULL);
+    ngx_conf_merge_str_value(conf->logout_uri, prev->logout_uri, "");
+    ngx_conf_merge_str_value(conf->post_logout_redirect_uri,
+                             prev->post_logout_redirect_uri, "");
+    ngx_conf_merge_uint_value(conf->client_auth_post, prev->client_auth_post, 0);
+    ngx_conf_merge_value(conf->refresh_token, prev->refresh_token, 0);
+    ngx_conf_merge_value(conf->introspection, prev->introspection, 0);
+    ngx_conf_merge_sec_value(conf->introspection_interval,
+                             prev->introspection_interval, 60);
+    ngx_conf_merge_ptr_value(conf->auth_args, prev->auth_args, NULL);
 
-    ngx_http_oidc_set_callback_path(conf);
+    ngx_http_oidc_uri_path(&conf->redirect_uri, &conf->callback_path);
+    ngx_http_oidc_uri_path(&conf->logout_uri, &conf->logout_path);
 
     if (ngx_http_oidc_set_client_basic(cf, conf) != NGX_OK) {
         return NGX_CONF_ERROR;
@@ -3127,6 +4286,63 @@ ngx_http_oidc_claims_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
         *name = value[i];
     }
+
+    return NGX_CONF_OK;
+}
+
+
+static ngx_conf_enum_t  ngx_http_oidc_client_auth[] = {
+    { ngx_string("basic"), 0 },   /* client_secret_basic (default) */
+    { ngx_string("post"),  1 },   /* client_secret_post */
+    { ngx_null_string, 0 }
+};
+
+
+/*
+ * oidc_session_store <size>
+ *
+ * Creates the shared memory zone that keeps sessions server side.  Without it
+ * the claims travel in the cookie and the tokens are only available during the
+ * login request, so RP-Initiated Logout with id_token_hint, refreshing and
+ * introspection all need this directive.
+ */
+static char *
+ngx_http_oidc_session_store(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_oidc_main_conf_t  *mcf = conf;
+    ngx_http_oidc_shm_t        *shm;
+    ngx_str_t                  *value = cf->args->elts;
+    ngx_str_t                   name = ngx_string("oidc_session_store");
+    ssize_t                     size;
+
+    if (mcf->shm_zone != NULL) {
+        return "is duplicate";
+    }
+
+    size = ngx_parse_size(&value[1]);
+
+    if (size == NGX_ERROR || size < (ssize_t) (8 * ngx_pagesize)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid oidc_session_store size \"%V\", "
+                           "it must be at least %uz bytes",
+                           &value[1], 8 * ngx_pagesize);
+        return NGX_CONF_ERROR;
+    }
+
+    shm = ngx_pcalloc(cf->pool, sizeof(ngx_http_oidc_shm_t));
+    if (shm == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    mcf->shm_zone = ngx_shared_memory_add(cf, &name, size,
+                                          &ngx_http_oidc_module);
+    if (mcf->shm_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    mcf->shm_zone->init = ngx_http_oidc_init_zone;
+    mcf->shm_zone->data = shm;
+    mcf->shm_size = size;
 
     return NGX_CONF_OK;
 }
@@ -3206,6 +4422,73 @@ static ngx_command_t ngx_http_oidc_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
       ngx_http_oidc_claims_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    /*
+     * RP-Initiated Logout: requests to this path drop the session and are
+     * redirected to the provider's end_session_endpoint.
+     */
+    { ngx_string("oidc_logout_uri"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, logout_uri),
+      NULL },
+
+    /* Where the provider should send the browser after the logout. */
+    { ngx_string("oidc_post_logout_redirect_uri"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, post_logout_redirect_uri),
+      NULL },
+
+    /* client_secret_basic (default) or client_secret_post. */
+    { ngx_string("oidc_client_auth"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, client_auth_post),
+      &ngx_http_oidc_client_auth },
+
+    /* Renew the tokens with the refresh token.  Needs oidc_session_store. */
+    { ngx_string("oidc_refresh_token"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, refresh_token),
+      NULL },
+
+    /* Ask the provider whether the access token is still active (RFC 7662). */
+    { ngx_string("oidc_introspection"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, introspection),
+      NULL },
+
+    /* How often introspection runs for one session. */
+    { ngx_string("oidc_introspection_interval"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, introspection_interval),
+      NULL },
+
+    /* Extra parameters appended to the authorization request. */
+    { ngx_string("oidc_auth_request_args"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_set_complex_value_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_oidc_loc_conf_t, auth_args),
+      NULL },
+
+    /* Keep the sessions in shared memory instead of in the cookie. */
+    { ngx_string("oidc_session_store"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_http_oidc_session_store,
+      NGX_HTTP_MAIN_CONF_OFFSET,
       0,
       NULL },
 
@@ -3299,6 +4582,12 @@ ngx_http_oidc_init(ngx_conf_t *cf)
           offsetof(ngx_http_oidc_ctx_t, token_basic) },
         { ngx_string("oidc_userinfo_bearer"),
           offsetof(ngx_http_oidc_ctx_t, userinfo_bearer) },
+        { ngx_string("oidc_id_token"),
+          offsetof(ngx_http_oidc_ctx_t, id_token) },
+        { ngx_string("oidc_introspect_url"),
+          offsetof(ngx_http_oidc_ctx_t, introspect_url) },
+        { ngx_string("oidc_introspect_body"),
+          offsetof(ngx_http_oidc_ctx_t, introspect_body) },
         { ngx_null_string, 0 }
     };
 

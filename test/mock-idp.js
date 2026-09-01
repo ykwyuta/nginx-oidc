@@ -58,10 +58,13 @@ app.get('/.well-known/openid-configuration', (req, res) => {
     token_endpoint: `${ISSUER}/token`,
     jwks_uri: `${ISSUER}/certs`,
     userinfo_endpoint: `${ISSUER}/userinfo`,
+    end_session_endpoint: `${ISSUER}/logout`,
+    introspection_endpoint: `${ISSUER}/introspect`,
     response_types_supported: ['code'],
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: [ALG],
-    token_endpoint_auth_methods_supported: ['client_secret_basic']
+    token_endpoint_auth_methods_supported: ['client_secret_basic',
+                                            'client_secret_post']
   });
 });
 
@@ -76,9 +79,10 @@ app.get('/certs', (req, res) => {
 app.get('/auth', (req, res) => {
   const { redirect_uri, state, nonce, client_id, code_challenge,
           code_challenge_method } = req.query;
-  // テスト用のフラグ（不正な署名 / 不正な aud の ID トークンを発行させる）
+  // テスト用のフラグ（不正な署名 / 不正な aud / 短命なアクセストークン）
   const badSig = req.query.bad_sig === '1' ? '1' : '';
   const badAud = req.query.bad_aud === '1' ? '1' : '';
+  const shortToken = req.query.short_token === '1' ? '1' : '';
 
   if (client_id !== CLIENT_ID) {
     return res.status(400).send('unknown client_id');
@@ -99,6 +103,7 @@ app.get('/auth', (req, res) => {
           <input type="hidden" name="code_challenge" value="${code_challenge}">
           <input type="hidden" name="bad_sig" value="${badSig}">
           <input type="hidden" name="bad_aud" value="${badAud}">
+          <input type="hidden" name="short_token" value="${shortToken}">
           <label>Username: <input type="text" name="username" value="testuser"></label><br>
           <label>Password: <input type="password" name="password" value="password"></label><br>
           <button type="submit" id="login-button">Login</button>
@@ -112,7 +117,7 @@ const authCodes = new Map();
 
 app.post('/auth/submit', (req, res) => {
   const { redirect_uri, state, nonce, username, password,
-          code_challenge, bad_sig, bad_aud } = req.body;
+          code_challenge, bad_sig, bad_aud, short_token } = req.body;
 
   if (username !== 'testuser' || password !== 'password') {
     return res.status(401).send('Invalid credentials');
@@ -120,7 +125,8 @@ app.post('/auth/submit', (req, res) => {
 
   const code = crypto.randomBytes(16).toString('hex');
   authCodes.set(code, { nonce, username, code_challenge, redirect_uri,
-                        badSig: bad_sig === '1', badAud: bad_aud === '1' });
+                        badSig: bad_sig === '1', badAud: bad_aud === '1',
+                        shortToken: short_token === '1' });
 
   const target = /^https?:\/\//.test(redirect_uri)
     ? redirect_uri
@@ -135,34 +141,83 @@ function base64url(buf) {
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-/* client_secret_basic (RFC 6749 2.3.1) のみを受け付ける */
+/*
+ * client_secret_basic (RFC 6749 2.3.1) と client_secret_post を受け付ける。
+ * 使われた方式を返し、テストから検証できるようにする。
+ */
 function checkClientAuth(req) {
   const header = req.headers['authorization'];
-  if (!header || !header.startsWith('Basic ')) {
-    return 'missing Basic authorization header';
+
+  if (header && header.startsWith('Basic ')) {
+    const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+    const sep = decoded.indexOf(':');
+    if (sep < 0) {
+      return { error: 'malformed Basic credentials' };
+    }
+
+    const id = decodeURIComponent(decoded.slice(0, sep));
+    const secret = decodeURIComponent(decoded.slice(sep + 1));
+
+    if (id !== CLIENT_ID || secret !== CLIENT_SECRET) {
+      return { error: 'invalid client credentials' };
+    }
+
+    return { method: 'basic' };
   }
 
-  const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
-  const sep = decoded.indexOf(':');
-  if (sep < 0) {
-    return 'malformed Basic credentials';
+  if (req.body.client_id !== undefined || req.body.client_secret !== undefined) {
+    if (req.body.client_id !== CLIENT_ID
+        || req.body.client_secret !== CLIENT_SECRET) {
+      return { error: 'invalid client credentials' };
+    }
+
+    return { method: 'post' };
   }
 
-  const id = decodeURIComponent(decoded.slice(0, sep));
-  const secret = decodeURIComponent(decoded.slice(sep + 1));
+  return { error: 'no client credentials' };
+}
 
-  if (id !== CLIENT_ID || secret !== CLIENT_SECRET) {
-    return 'invalid client credentials';
-  }
+// 発行済みのアクセストークン: token -> { active }
+const accessTokens = new Map();
+// 発行済みのリフレッシュトークン: token -> context
+const refreshTokens = new Map();
 
-  return null;
+function issueTokens(context, authMethod, refreshed) {
+  const now = Math.floor(Date.now() / 1000);
+
+  const accessToken = crypto.randomBytes(16).toString('hex');
+  accessTokens.set(accessToken, { active: true });
+
+  const refreshToken = crypto.randomBytes(16).toString('hex');
+  refreshTokens.set(refreshToken, { ...context, refreshed: true });
+
+  const idToken = jwt.sign({
+    iss: ISSUER,
+    sub: 'user-123',
+    aud: context.badAud ? 'some-other-client' : CLIENT_ID,
+    exp: now + 3600,
+    iat: now,
+    nonce: context.nonce,
+    email: 'testuser@example.com',
+    // リフレッシュされたことをテストから見えるようにする
+    name: refreshed ? 'Test User (refreshed)' : 'Test User',
+    token_auth: authMethod
+  }, context.badSig ? rogueKey : privateKey, { algorithm: ALG, keyid: kid });
+
+  return {
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: context.shortToken && !refreshed ? 1 : 3600,
+    refresh_token: refreshToken,
+    id_token: idToken
+  };
 }
 
 app.post('/token', (req, res) => {
-  const authError = checkClientAuth(req);
-  if (authError) {
-    console.log(`[IdP] token request rejected: ${authError}`);
-    return res.status(401).json({ error: 'invalid_client', details: authError });
+  const auth = checkClientAuth(req);
+  if (auth.error) {
+    console.log(`[IdP] token request rejected: ${auth.error}`);
+    return res.status(401).json({ error: 'invalid_client', details: auth.error });
   }
 
   // 認可コードや client_secret がクエリに載っていないことをテストで担保する
@@ -172,7 +227,19 @@ app.post('/token', (req, res) => {
                                   details: 'parameters must be sent in the body' });
   }
 
-  const { grant_type, code, code_verifier } = req.body;
+  const { grant_type, code, code_verifier, refresh_token } = req.body;
+
+  if (grant_type === 'refresh_token') {
+    const context = refreshTokens.get(refresh_token);
+    if (!context) {
+      console.log('[IdP] invalid refresh_token');
+      return res.status(400).json({ error: 'invalid_grant' });
+    }
+    refreshTokens.delete(refresh_token);
+
+    console.log(`[IdP] tokens refreshed (auth=${auth.method})`);
+    return res.json(issueTokens(context, auth.method, true));
+  }
 
   if (grant_type !== 'authorization_code') {
     return res.status(400).json({ error: 'unsupported_grant_type' });
@@ -193,31 +260,66 @@ app.post('/token', (req, res) => {
     return res.status(400).json({ error: 'invalid_grant', details: 'PKCE' });
   }
 
-  const now = Math.floor(Date.now() / 1000);
-  const idToken = jwt.sign({
-    iss: ISSUER,
-    sub: 'user-123',
-    aud: context.badAud ? 'some-other-client' : CLIENT_ID,
-    exp: now + 3600,
-    iat: now,
-    nonce: context.nonce,
-    email: 'testuser@example.com',
-    name: 'Test User'
-  }, context.badSig ? rogueKey : privateKey, { algorithm: ALG, keyid: kid });
+  console.log(`[IdP] token issued (auth=${auth.method}, `
+              + `bad_sig=${!!context.badSig}, bad_aud=${!!context.badAud})`);
+  res.json(issueTokens(context, auth.method, false));
+});
 
-  console.log(`[IdP] token issued (bad_sig=${!!context.badSig}, `
-              + `bad_aud=${!!context.badAud})`);
-  res.json({
-    access_token: 'dummy_access_token',
-    token_type: 'Bearer',
-    expires_in: 3600,
-    id_token: idToken
-  });
+/* RFC 7662 Token Introspection */
+app.post('/introspect', (req, res) => {
+  const auth = checkClientAuth(req);
+  if (auth.error) {
+    return res.status(401).json({ error: 'invalid_client' });
+  }
+
+  const state = accessTokens.get(req.body.token);
+  const active = !!(state && state.active);
+
+  console.log(`[IdP] introspect -> active=${active}`);
+  res.json(active
+    ? { active: true, sub: 'user-123', client_id: CLIENT_ID }
+    : { active: false });
+});
+
+/* RP-Initiated Logout */
+app.get('/logout', (req, res) => {
+  const { id_token_hint, post_logout_redirect_uri, client_id } = req.query;
+
+  console.log(`[IdP] logout (client_id=${client_id}, `
+              + `id_token_hint=${id_token_hint ? 'yes' : 'no'})`);
+
+  if (id_token_hint) {
+    try {
+      jwt.verify(id_token_hint, publicKey, { algorithms: [ALG],
+                                             audience: CLIENT_ID });
+    } catch (e) {
+      return res.status(400).send(`invalid id_token_hint: ${e.message}`);
+    }
+  }
+
+  if (post_logout_redirect_uri) {
+    return res.redirect(post_logout_redirect_uri);
+  }
+
+  res.send('<html><body><h1>Logged out</h1></body></html>');
+});
+
+/* テスト用: 発行済みのアクセストークンをすべて失効させる */
+app.post('/test/revoke', (req, res) => {
+  let n = 0;
+  for (const state of accessTokens.values()) {
+    state.active = false;
+    n++;
+  }
+  console.log(`[IdP] revoked ${n} access token(s)`);
+  res.json({ revoked: n });
 });
 
 app.get('/userinfo', (req, res) => {
-  const header = req.headers['authorization'];
-  if (header !== 'Bearer dummy_access_token') {
+  const header = req.headers['authorization'] || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+
+  if (!token || !accessTokens.has(token)) {
     return res.status(401).send('Unauthorized');
   }
 

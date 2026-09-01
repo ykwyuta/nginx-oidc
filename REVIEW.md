@@ -47,6 +47,22 @@ typedef struct {
     ngx_str_t userinfo_endpoint;       /* 任意 */
 } ngx_http_oidc_provider_metadata_t;
 
+/* 共有メモリ上のセッション（oidc_session_store 有効時） */
+typedef struct {
+    ngx_rbtree_node_t  node;          /* node.key = セッション ID の crc32 */
+    ngx_queue_t        queue;         /* LRU */
+    time_t             expires;
+    time_t             issued;
+    time_t             access_expires;
+    time_t             introspected;
+    u_char             sid[64];
+    u_short            id_token_len;
+    u_short            access_token_len;
+    u_short            refresh_token_len;
+    u_short            claims_len;
+    u_char             data[1];       /* claims || id_token || access || refresh */
+} ngx_http_oidc_sess_t;
+
 /* ロケーション単位の Discovery キャッシュ */
 typedef struct {
     ngx_http_oidc_provider_metadata_t *metadata;
@@ -72,6 +88,14 @@ typedef struct {
     ngx_flag_t   oidc_use_userinfo;
     time_t       session_timeout;
     ngx_array_t *session_claims;   /* oidc_claims の許可リスト（NULL なら既定） */
+
+    ngx_str_t    logout_uri;                /* oidc_logout_uri */
+    ngx_str_t    post_logout_redirect_uri;
+    ngx_uint_t   client_auth_post;          /* oidc_client_auth post */
+    ngx_flag_t   refresh_token;             /* oidc_refresh_token */
+    ngx_flag_t   introspection;             /* oidc_introspection */
+    time_t       introspection_interval;
+    ngx_http_complex_value_t *auth_args;    /* oidc_auth_request_args */
 
     ngx_str_t    client_basic;     /* "Basic base64(id:secret)" を設定時に生成 */
     ngx_str_t    callback_path;    /* redirect_uri のパス部分 */
@@ -111,6 +135,8 @@ typedef struct {
 - **メタデータはロケーション単位**（`ngx_http_oidc_loc_conf_t.cache`）。main conf に 1 組だけ持つ実装では、複数の location に異なる `oidc_provider` を設定したときに先勝ちで混線するため。
 - **キャッシュは世代ごとに専用プール**を持ち、再取得時に旧世代を解放する。リクエストはアクセスフェーズで `ngx_http_oidc_copy_metadata()` によりリクエストプールへコピーを取るため、解放が実行中のリクエストに影響しない。
 - **内部ロケーションへ渡す値はすべてリクエストコンテキスト**に置き、変数ハンドラは `r->main` の ctx を読む。main conf に置くとリクエストをまたいで競合し、SSRF 対策としても不正確になる。
+- **セッションの保存先は 2 通り**。既定ではクレームを HMAC 署名付き Cookie に載せる（ステートレス）。`oidc_session_store` を設定すると共有メモリの rbtree + LRU キューに保持し、Cookie には 256 bit の乱数 ID だけを載せる。ID トークン・アクセストークン・リフレッシュトークンは Cookie に載せるには大きすぎ、リフレッシュトークンはクライアントに渡すべきでないため、ログアウトの `id_token_hint`・トークン更新・イントロスペクションはストアモードを前提とする。
+- **ストアの排他**は `ngx_slab_pool_t` のミューテックスで行い、ロード時はリクエストプールにコピーしてすぐロックを外す。満杯のときは期限切れ、次いで LRU の末尾から追い出す。
 
 ---
 
@@ -183,7 +209,9 @@ Discovery だけはアクセスハンドラ自身から発行するため、完�
 
 ## 主要関数の解説
 
-### `ngx_http_oidc_access_handler`（行 2748 付近）
+（行番号は目安です。実装の変更で前後します。）
+
+### `ngx_http_oidc_access_handler`
 
 アクセスフェーズの入口。順に判定します。
 
@@ -192,9 +220,15 @@ Discovery だけはアクセスハンドラ自身から発行するため、完�
 3. `ctx->waiting` → `NGX_AGAIN`（連鎖の完了待ち）
 4. 必須ディレクティブの未設定 → 500
 5. メタデータ未取得または TTL 切れ → Discovery 開始（`NGX_AGAIN`）
-6. URI が `callback_path` と**完全一致** → コールバック処理
-7. セッション Cookie が有効 → クレームを復元して `NGX_DECLINED`
-8. それ以外 → IdP へ 302
+6. URI が `logout_path` と完全一致 → ログアウト処理
+7. URI が `callback_path` と**完全一致** → コールバック処理
+8. セッションが有効な場合（ストアモードのみ）
+   - アクセストークンが期限切れで `oidc_refresh_token on` → リフレッシュ開始（`NGX_AGAIN`）
+   - `oidc_introspection on` かつ前回確認から `oidc_introspection_interval` 経過 → イントロスペクション開始（`NGX_AGAIN`）
+9. セッションが有効 → クレームを復元して `NGX_DECLINED`
+10. それ以外 → IdP へ 302
+
+リフレッシュとイントロスペクションはコールバックではなく**通常のリクエスト**でサブリクエストを発行します。完了後は `done` を立てずに `waiting` を下ろすだけなので、親はそのままフェーズを続行し、更新後のセッションで再判定されます。
 
 ### `ngx_http_oidc_discovery_handler`（行 1152 付近）
 
@@ -231,6 +265,20 @@ OIDC Core 3.1.3.7 に従い、`iss`（Discovery の `issuer` と一致）、`aud
 ### `ngx_http_oidc_merge_claims` / `ngx_http_oidc_claim_to_str`（行 1013 / 815 付近）
 
 ID トークンと UserInfo のクレームを取り込みます。文字列・整数・実数・真偽値に加え、**配列はカンマ区切りに展開**します（Keycloak や Entra ID の `groups` / `roles` はしばしば配列で返るため）。プロトコルクレーム（`iss` `aud` `exp` `iat` `nbf` `jti` `nonce` `azp` `at_hash` `c_hash` `s_hash` `auth_time` `sid` `typ` `session_state`）と、専用フィールドを持つ `sub` / `email` / `name` は `extra_claims` に入れません。`oidc_claims` を設定した場合はその許可リストのみを取り込みます。
+
+### リフレッシュとイントロスペクション
+
+`ngx_http_oidc_start_refresh_request()` は `grant_type=refresh_token` でトークンエンドポイントに問い合わせます。`ctx->phase` が `OIDC_PHASE_REFRESH` のとき、
+
+- 新しい ID トークンが返れば JWKS で署名を検証し、`iss` / `aud` / `exp` に加えて **`sub` が元のセッションと一致すること**を確認します（`nonce` は認可リクエストのものなので検証しません）
+- ID トークンが返らない場合はクレームをそのままにトークンだけを差し替えます
+- 失敗した場合はセッションを破棄し、通常の再認証にフォールバックします（ユーザーにはエラーを見せません）
+
+`ngx_http_oidc_start_introspect_request()` は RFC 7662 のイントロスペクションを行い、`active: false` ならセッションを破棄します。エンドポイントに到達できない場合はセッションを残し（フェイルオープン）、確認時刻を更新しないので次のリクエストで再試行します。
+
+### `ngx_http_oidc_logout`
+
+セッションを破棄して Cookie を消し、IdP の `end_session_endpoint` へ `client_id`・`id_token_hint`（ストアモードのみ）・`post_logout_redirect_uri` を付けてリダイレクトします。`end_session_endpoint` が無い IdP ではローカルのセッションだけを消して `oidc_post_logout_redirect_uri` へ戻します。
 
 ### `ngx_http_oidc_userinfo_handler`（行 2206 付近）
 
@@ -298,10 +346,7 @@ UserInfo の失敗のみ非致命的（警告ログを出して ID トークン�
 
 | 機能 | 説明 |
 |------|------|
-| RP-Initiated Logout | `end_session_endpoint` へのリダイレクト。シングルサインアウトに必要 |
-| リフレッシュトークン | アクセストークンの自動更新 |
-| Token Introspection | IdP への失効確認 |
-| `client_secret_post` | `client_secret_basic` を受け付けない IdP への対応 |
-| `$oidc_id_token` 変数 | ID トークンをそのままバックエンドへ渡す用途 |
-| `extra_auth_args` | `login_hint` や `prompt=select_account` などの追加パラメータ |
-| サーバーサイドセッション | スケールアウト時の失効管理。現状は HMAC Cookie のみ |
+| Back-Channel / Front-Channel Logout | IdP からの通知でセッションを破棄する方式。現状は RP-Initiated Logout のみ |
+| 外部セッションストア（Redis 等） | 共有メモリはホスト内で共有される。複数ホスト間で共有するには外部ストアが必要 |
+| `private_key_jwt` / `client_secret_jwt` | クライアント認証は `client_secret_basic` と `client_secret_post` のみ |
+| `oidc_provider` ブロック構文 | NGINX Plus モジュールとの設定互換 |

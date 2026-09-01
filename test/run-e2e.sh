@@ -35,17 +35,29 @@ mkdir -p "$WORK_DIR/conf" "$WORK_DIR/logs"
 cp "$MIME_TYPES" "$WORK_DIR/conf/mime.types"
 
 sed "s#^load_module .*#load_module $OIDC_MODULE;#" \
-    "$TEST_DIR/nginx.conf" > "$WORK_DIR/conf/nginx.conf"
+    "$TEST_DIR/nginx.conf" > "$WORK_DIR/conf/nginx-store.conf"
+
+# セッションストアを無効にした（Cookie にクレームを載せる）構成も用意する
+sed "s|^\( *\)oidc_session_store |\1# oidc_session_store |" \
+    "$WORK_DIR/conf/nginx-store.conf" > "$WORK_DIR/conf/nginx-cookie.conf"
+
+stop_nginx() {
+    [ -n "$RUNNING_CONF" ] || return 0
+    "$NGINX_BIN" -p "$WORK_DIR" -c "$RUNNING_CONF" -s stop 2>/dev/null || true
+    RUNNING_CONF=
+    sleep 1
+}
 
 cleanup() {
     [ -n "$IDP_PID" ] && kill "$IDP_PID" 2>/dev/null || true
     [ -n "$IDP_B_PID" ] && kill "$IDP_B_PID" 2>/dev/null || true
-    "$NGINX_BIN" -p "$WORK_DIR" -c "$WORK_DIR/conf/nginx.conf" -s stop 2>/dev/null || true
+    stop_nginx
 }
 trap cleanup EXIT INT TERM
 
 echo "==> checking the configuration"
-"$NGINX_BIN" -p "$WORK_DIR" -c "$WORK_DIR/conf/nginx.conf" -t
+"$NGINX_BIN" -p "$WORK_DIR" -c "$WORK_DIR/conf/nginx-store.conf" -t
+"$NGINX_BIN" -p "$WORK_DIR" -c "$WORK_DIR/conf/nginx-cookie.conf" -t
 
 echo "==> starting the mock IdP"
 ( cd "$TEST_DIR" && node mock-idp.js > "$WORK_DIR/logs/idp.log" 2>&1 ) &
@@ -77,12 +89,22 @@ while [ $i -lt 50 ]; do
 done
 [ $i -lt 50 ] || { echo "the second mock IdP did not start" >&2; cat "$WORK_DIR/logs/idp-b.log"; exit 1; }
 
-echo "==> starting NGINX"
-"$NGINX_BIN" -p "$WORK_DIR" -c "$WORK_DIR/conf/nginx.conf"
+STATUS=0
 
-echo "==> running the Playwright tests"
-( cd "$TEST_DIR" && npx playwright test )
-STATUS=$?
+for MODE in store cookie; do
+    echo "==> starting NGINX (session mode: $MODE)"
+    RUNNING_CONF="$WORK_DIR/conf/nginx-$MODE.conf"
+    "$NGINX_BIN" -p "$WORK_DIR" -c "$RUNNING_CONF"
+
+    echo "==> running the Playwright tests (session mode: $MODE)"
+    if ! ( cd "$TEST_DIR" && OIDC_TEST_MODE="$MODE" npx playwright test ); then
+        STATUS=1
+    fi
+
+    stop_nginx
+
+    [ $STATUS -eq 0 ] || break
+done
 
 if [ $STATUS -ne 0 ]; then
     echo "---- nginx error.log ----"

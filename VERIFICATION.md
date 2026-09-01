@@ -5,6 +5,7 @@
 
 - 初回検証: 2026-09-01（対象コミット `0f0719a`）— 致命的欠陥 3 件を含む 16 件を検出
 - 修正後の再検証: 2026-09-01 — 検出した全件を修正し、実モジュールに対する E2E 8 シナリオが通過
+- 追加機能の実装後: 2026-09-01 — 未実装として残っていた機能を実装し、E2E 14 シナリオ（ストアモード）/ 11 シナリオ（Cookie モード）が通過
 
 ---
 
@@ -113,16 +114,55 @@ OIDC: ID token aud does not contain oidc_client_id
 
 ---
 
-## 4. 残タスク（未実装機能）
+## 4. 追加機能の実装
 
-以下は初回検証時から「未実装」として整理されているもので、今回の修正対象外である。
+初回検証で「未実装」として整理していた機能をすべて実装した。
 
-| 優先度 | 機能 | 説明 |
-|--------|------|------|
-| P2 | RP-Initiated Logout | `end_session_endpoint` へのリダイレクト。シングルサインアウトに必要 |
-| P3 | `client_secret_post` | `client_secret_basic` を受け付けない IdP への対応 |
-| P3 | `$oidc_id_token` 変数 | ID トークンをそのままバックエンドへ渡す用途 |
-| P3 | `extra_auth_args` | `login_hint` や `prompt=select_account` などの追加パラメータ |
-| P4 | リフレッシュトークン | アクセストークンの自動更新 |
-| P4 | Token Introspection | IdP への失効確認 |
-| P4 | サーバーサイドセッション | スケールアウト時の失効管理 |
+| 機能 | 実装内容 |
+|------|---------|
+| **サーバーサイドセッション** | `oidc_session_store <size>` で共有メモリゾーンを作成し、rbtree + LRU キューでセッションを保持する。Cookie は 256 bit のセッション ID のみを持つ。満杯時は期限切れ、次いで LRU 末尾から追い出す。ID トークン・アクセストークン・リフレッシュトークンを保持できるようになり、以下の 3 機能の前提となる |
+| **RP-Initiated Logout** | `oidc_logout_uri` / `oidc_post_logout_redirect_uri` を追加。セッションと Cookie を破棄し、Discovery の `end_session_endpoint` へ `client_id`・`id_token_hint`・`post_logout_redirect_uri` を付けてリダイレクトする。`end_session_endpoint` が無い IdP ではローカルセッションのみ破棄 |
+| **リフレッシュトークン** | `oidc_refresh_token on` で、アクセストークンの失効時に `grant_type=refresh_token` で更新する。新しい ID トークンが返れば署名と `iss`/`aud`/`exp` に加え `sub` の一致を検証する（`nonce` は認可リクエストのものなので検証しない）。更新に失敗した場合はセッションを破棄して通常の再認証にフォールバックする。Cookie の Max-Age も更新する |
+| **Token Introspection** | `oidc_introspection on` / `oidc_introspection_interval` で RFC 7662 の失効確認を行う。`active: false` ならセッションを破棄。エンドポイントに到達できない場合はフェイルオープンし、確認時刻を更新しないため次のリクエストで再試行する |
+| **`client_secret_post`** | `oidc_client_auth basic\|post` を追加。post のときは `client_secret` をボディに入れる（`client_id` は常にボディにあるため二重に送らない） |
+| **`$oidc_id_token`** | ID トークンを変数として公開。ストアモードでは継続リクエストでも利用可能 |
+| **`oidc_auth_request_args`** | 認可リクエストへの追加パラメータ。complex value なので `login_hint=$arg_login_hint` のように変数も使える |
+
+### 追加機能の検証
+
+`test/run-e2e.sh` はストアあり・なしの両構成でテストを実行する。
+
+```
+==> running the Playwright tests (session mode: store)
+  14 passed
+==> running the Playwright tests (session mode: cookie)
+  3 skipped
+  11 passed
+```
+
+追加したシナリオ:
+
+| シナリオ | 検証する機能 |
+|---------|-------------|
+| `oidc_auth_request_args` の `prompt` / `login_hint` が認可 URL に付く | `oidc_auth_request_args` |
+| モック IdP が post 方式のクライアント認証を受け取る | `client_secret_post` |
+| ログイン後の通常リクエストで ID トークンが取り出せる | `$oidc_id_token` + ストア |
+| `expires_in=1` のトークン失効後、更新後の ID トークン由来のクレームになる | リフレッシュトークン |
+| IdP 側で失効させたアクセストークンが検出され再認証になる | Token Introspection |
+| `end_session_endpoint` 経由で `post_logout_redirect_uri` に戻り、セッションが消える | RP-Initiated Logout |
+
+手動での追加確認:
+
+- 4 ワーカー構成で、同一セッションが全ワーカーから参照できること（共有メモリの検証）
+- リフレッシュが発生したレスポンスに、更新後の Max-Age を持つ `Set-Cookie` が付くこと
+- ログアウトの `Location` に `client_id` / `id_token_hint` / `post_logout_redirect_uri` が含まれること
+- アクセスログ・エラーログに `client_secret` / `code_verifier` / トークン類が残らないこと（0 件）、`[alert]` / `[crit]` が 0 件であること
+
+## 5. 残タスク
+
+| 機能 | 説明 |
+|------|------|
+| Back-Channel / Front-Channel Logout | IdP からの通知でセッションを破棄する方式。現状は RP-Initiated Logout のみ |
+| 外部セッションストア（Redis 等） | 共有メモリはホスト内で共有される。複数ホスト間で共有するには外部ストアが必要 |
+| `private_key_jwt` / `client_secret_jwt` | クライアント認証は `client_secret_basic` と `client_secret_post` のみ |
+| `oidc_provider` ブロック構文 | NGINX Plus モジュールとの設定互換 |
