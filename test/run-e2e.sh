@@ -37,9 +37,18 @@ cp "$MIME_TYPES" "$WORK_DIR/conf/mime.types"
 sed "s#^load_module .*#load_module $OIDC_MODULE;#" \
     "$TEST_DIR/nginx.conf" > "$WORK_DIR/conf/nginx-store.conf"
 
-# セッションストアを無効にした（Cookie にクレームを載せる）構成も用意する
+# セッションストアを無効にした（Cookie にクレームを載せる）構成
 sed "s|^\( *\)oidc_session_store |\1# oidc_session_store |" \
     "$WORK_DIR/conf/nginx-store.conf" > "$WORK_DIR/conf/nginx-cookie.conf"
+
+# セッションを Redis に置く構成
+sed "s|^\( *\)oidc_session_store .*|\1oidc_session_store redis;|" \
+    "$WORK_DIR/conf/nginx-store.conf" > "$WORK_DIR/conf/nginx-redis.conf"
+
+# private_key_jwt 用のクライアント鍵を用意する
+openssl genrsa -out "$WORK_DIR/conf/client-key.pem" 2048 2>/dev/null
+openssl rsa -in "$WORK_DIR/conf/client-key.pem" -pubout \
+        -out "$WORK_DIR/conf/client-pub.pem" 2>/dev/null
 
 stop_nginx() {
     [ -n "$RUNNING_CONF" ] || return 0
@@ -51,6 +60,7 @@ stop_nginx() {
 cleanup() {
     [ -n "$IDP_PID" ] && kill "$IDP_PID" 2>/dev/null || true
     [ -n "$IDP_B_PID" ] && kill "$IDP_B_PID" 2>/dev/null || true
+    [ -n "$REDIS_PID" ] && kill "$REDIS_PID" 2>/dev/null || true
     stop_nginx
 }
 trap cleanup EXIT INT TERM
@@ -58,9 +68,25 @@ trap cleanup EXIT INT TERM
 echo "==> checking the configuration"
 "$NGINX_BIN" -p "$WORK_DIR" -c "$WORK_DIR/conf/nginx-store.conf" -t
 "$NGINX_BIN" -p "$WORK_DIR" -c "$WORK_DIR/conf/nginx-cookie.conf" -t
+"$NGINX_BIN" -p "$WORK_DIR" -c "$WORK_DIR/conf/nginx-redis.conf" -t
+
+echo "==> starting redis"
+redis-server --port 6399 --save '' --appendonly no --dir "$WORK_DIR" \
+             --logfile "$WORK_DIR/logs/redis.log" --daemonize no &
+REDIS_PID=$!
+
+i=0
+while [ $i -lt 50 ]; do
+    if redis-cli -p 6399 ping >/dev/null 2>&1; then break; fi
+    i=$((i + 1))
+    sleep 0.2
+done
+[ $i -lt 50 ] || { echo "redis did not start" >&2; cat "$WORK_DIR/logs/redis.log"; exit 1; }
 
 echo "==> starting the mock IdP"
-( cd "$TEST_DIR" && node mock-idp.js > "$WORK_DIR/logs/idp.log" 2>&1 ) &
+( cd "$TEST_DIR" \
+  && MOCK_IDP_CLIENT_PUBKEY="$WORK_DIR/conf/client-pub.pem" \
+     node mock-idp.js > "$WORK_DIR/logs/idp.log" 2>&1 ) &
 IDP_PID=$!
 
 i=0
@@ -91,7 +117,8 @@ done
 
 STATUS=0
 
-for MODE in store cookie; do
+for MODE in store redis cookie; do
+    redis-cli -p 6399 flushall >/dev/null 2>&1 || true
     echo "==> starting NGINX (session mode: $MODE)"
     RUNNING_CONF="$WORK_DIR/conf/nginx-$MODE.conf"
     "$NGINX_BIN" -p "$WORK_DIR" -c "$RUNNING_CONF"
@@ -113,6 +140,8 @@ if [ $STATUS -ne 0 ]; then
     tail -50 "$WORK_DIR/logs/idp.log" || true
     echo "---- mock idp (tenant-b) log ----"
     tail -50 "$WORK_DIR/logs/idp-b.log" || true
+    echo "---- redis log ----"
+    tail -20 "$WORK_DIR/logs/redis.log" || true
 fi
 
 exit $STATUS

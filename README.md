@@ -16,11 +16,13 @@ NGINX Open Source 向けの OpenID Connect (OIDC) 認証ダイナミックモジ
 - **SSRF 対策**: IdP の URL はすべてモジュールが提供する変数経由で `proxy_pass` に渡す
 - **マルチワーカー対応**: `oidc_cookie_secret` で全ワーカー間の HMAC シークレットを統一
 - **タイミング攻撃対策**: Cookie・state・nonce の比較に `CRYPTO_memcmp()` を使用
-- **サーバーサイドセッション**: `oidc_session_store` で共有メモリにセッションを保持（Cookie はセッション ID のみ）
+- **サーバーサイドセッション**: `oidc_session_store` で共有メモリまたは **Redis** にセッションを保持（Cookie はセッション ID のみ）
 - **RP-Initiated Logout**: `oidc_logout_uri` で IdP の `end_session_endpoint` へ `id_token_hint` 付きでリダイレクト
 - **リフレッシュトークン**: アクセストークンの失効時に自動更新（`oidc_refresh_token on`）
 - **Token Introspection**: RFC 7662 でアクセストークンの失効を検知（`oidc_introspection on`）
-- **クライアント認証**: `client_secret_basic`（既定）と `client_secret_post` を選択可能
+- **クライアント認証**: `client_secret_basic`（既定）/ `client_secret_post` / `client_secret_jwt` / `private_key_jwt`
+- **Back-Channel / Front-Channel Logout**: IdP からの通知で該当セッションを破棄
+- **`oidc_provider` ブロック**: NGINX Plus 互換の名前付きプロバイダ定義
 
 ## 依存ライブラリ
 
@@ -64,10 +66,12 @@ http {
     # resolver が無いと "no resolver defined to resolve <host>" で失敗する。
     resolver 127.0.0.53 ipv6=off valid=300s;
 
-    # セッションを共有メモリに保持する（推奨）。
-    # ログアウトの id_token_hint・リフレッシュトークン・イントロスペクションは
-    # トークンを保持する必要があるため、この設定が前提となる。
+    # セッションの保存先。サイズを指定すると共有メモリ、redis と書くと Redis。
+    # ログアウトの id_token_hint・リフレッシュトークン・イントロスペクション・
+    # Back-Channel / Front-Channel Logout はトークンやインデックスの保持が
+    # 必要なため、いずれかの設定が前提となる。
     oidc_session_store 10m;
+    # oidc_session_store redis;
 
     server {
         listen 443 ssl;
@@ -118,6 +122,14 @@ http {
             proxy_ssl_server_name         on;
         }
 
+        # oidc_session_store redis; のときのみ必要
+        location = /_oidc_redis {
+            internal;
+            oidc_redis_pass 127.0.0.1:6379;
+            # oidc_redis_password "...";
+            # oidc_redis_database 0;
+        }
+
         # oidc_introspection on; のときのみ必要
         location = /_oidc_introspect {
             internal;
@@ -149,6 +161,10 @@ http {
             oidc_logout_uri               "https://app.example.com/logout";
             oidc_post_logout_redirect_uri "https://app.example.com/";
 
+            # IdP からのログアウト通知を受ける（oidc_session_store が必要）
+            oidc_backchannel_logout_uri   "https://app.example.com/backchannel-logout";
+            oidc_frontchannel_logout_uri  "https://app.example.com/frontchannel-logout";
+
             # 任意: アクセストークンの自動更新と失効確認（oidc_session_store が必要）
             # oidc_refresh_token          on;
             # oidc_introspection          on;
@@ -156,6 +172,9 @@ http {
 
             # 任意: クライアント認証方式（既定は basic）
             # oidc_client_auth post;
+            # oidc_client_auth private_key_jwt;
+            # oidc_client_jwt_key /etc/nginx/oidc-client.key;
+            # oidc_client_jwt_kid "my-key-1";
 
             # 任意: 認可リクエストへの追加パラメータ
             # oidc_auth_request_args "prompt=select_account";
@@ -181,7 +200,8 @@ http {
 | ディレクティブ | コンテキスト | デフォルト | 説明 |
 |--------------|------------|-----------|------|
 | `auth_oidc on\|off` | http, server, location | off | OIDC 認証の有効/無効 |
-| `oidc_provider <url>` | http, server, location | — | IdP の issuer URL（Discovery に使用） |
+| `oidc_provider <url>` | server, location | — | IdP の issuer URL（Discovery に使用） |
+| `oidc_provider <name> { ... }` | http | — | 名前付きプロバイダの定義（NGINX Plus 互換） |
 | `oidc_client_id <id>` | http, server, location | — | OAuth クライアント ID |
 | `oidc_client_secret <secret>` | http, server, location | — | OAuth クライアントシークレット |
 | `oidc_redirect_uri <uri>` | http, server, location | — | コールバック URI（IdP 登録済みの絶対 URI 推奨） |
@@ -191,30 +211,51 @@ http {
 | `oidc_claims <name>...` | http, server, location | — | `$oidc_claim_*` として公開しセッションに保存するクレームを限定 |
 | `oidc_logout_uri <uri>` | http, server, location | — | このパスへのリクエストでログアウトする（RP-Initiated Logout） |
 | `oidc_post_logout_redirect_uri <uri>` | http, server, location | — | ログアウト後の戻り先。IdP に登録が必要 |
-| `oidc_client_auth basic\|post` | http, server, location | basic | トークン／イントロスペクションのクライアント認証方式 |
+| `oidc_client_auth <method>` | http, server, location | basic | `basic` / `post` / `client_secret_jwt` / `private_key_jwt` |
 | `oidc_refresh_token on\|off` | http, server, location | off | アクセストークン失効時にリフレッシュトークンで更新（`oidc_session_store` が必要） |
 | `oidc_introspection on\|off` | http, server, location | off | アクセストークンの失効確認（RFC 7662、`oidc_session_store` が必要） |
 | `oidc_introspection_interval <time>` | http, server, location | `60s` | 同一セッションに対する失効確認の間隔 |
 | `oidc_auth_request_args <value>` | http, server, location | — | 認可リクエストに付ける追加パラメータ（変数使用可） |
-| `oidc_session_store <size>` | http | — | セッションを共有メモリに保持する（例 `10m`）。最小 8 ページ |
+| `oidc_backchannel_logout_uri <uri>` | http, server, location | — | IdP が logout token を POST してくるエンドポイント |
+| `oidc_frontchannel_logout_uri <uri>` | http, server, location | — | IdP が iframe で読み込むログアウトエンドポイント |
+| `oidc_client_jwt_key <file>` | http, server, location | — | `private_key_jwt` の署名に使う PEM 秘密鍵 |
+| `oidc_client_jwt_kid <kid>` | http, server, location | — | client assertion の `kid` ヘッダ |
+| `oidc_client_jwt_alg <alg>` | http, server, location | RS256 / HS256 | client assertion の署名アルゴリズム |
+| `oidc_session_store <size\|redis>` | http | — | セッションの保存先。サイズなら共有メモリ（例 `10m`、最小 8 ページ）、`redis` なら Redis |
+| `oidc_redis_pass <addr>` | location | — | Redis の宛先（`/_oidc_redis` ロケーションに書く） |
+| `oidc_redis_password <pw>` | http, server, location | — | Redis の AUTH パスワード |
+| `oidc_redis_database <n>` | http, server, location | 0 | Redis のデータベース番号 |
+| `oidc_redis_connect_timeout <t>` | http, server, location | `5s` | Redis への接続タイムアウト |
+| `oidc_redis_send_timeout <t>` | http, server, location | `5s` | Redis への送信タイムアウト |
+| `oidc_redis_read_timeout <t>` | http, server, location | `5s` | Redis からの受信タイムアウト |
+| `oidc_redis_buffer_size <size>` | http, server, location | `16k` | Redis 応答の読み取りバッファ。セッション 1 件分が収まる必要がある |
 | `oidc_cookie_secret <secret>` | http | — | セッション Cookie の HMAC シークレット（Cookie モードで必須） |
 
 `oidc_claims` を指定しない場合、プロトコルクレーム（`iss` `aud` `exp` `iat` `nbf` `jti` `nonce` `azp` `at_hash` `c_hash` `s_hash` `auth_time` `sid` `typ` `session_state`）を除くすべてのクレームが取り込まれます。
 
 ### セッションの保存方式
 
-| | Cookie モード（既定） | ストアモード（`oidc_session_store`） |
-|---|---|---|
-| Cookie の内容 | HMAC 署名 + クレーム | 256 bit のセッション ID のみ |
-| クレームの上限 | 3500 バイト | 事実上なし |
-| ID トークン / アクセストークン / リフレッシュトークン | 初回認証リクエストのみ保持 | セッションが生きている間ずっと保持 |
-| `$oidc_id_token` / `$oidc_access_token` | 初回認証リクエストのみ | 常に利用可能 |
-| ログアウト時の `id_token_hint` | 付かない | 付く |
-| `oidc_refresh_token` / `oidc_introspection` | 利用不可 | 利用可能 |
-| 追加のメモリ | なし | `oidc_session_store` のサイズ |
-| NGINX 再起動 | セッション維持 | セッション消失（再認証になる） |
+| | Cookie（既定） | 共有メモリ（`oidc_session_store <size>`） | Redis（`oidc_session_store redis`） |
+|---|---|---|---|
+| Cookie の内容 | HMAC 署名 + クレーム | 256 bit のセッション ID のみ | 256 bit のセッション ID のみ |
+| クレームの上限 | 3500 バイト | 事実上なし | 事実上なし |
+| ID / アクセス / リフレッシュトークン | 初回認証リクエストのみ保持 | セッションが生きている間ずっと保持 | 同左 |
+| `$oidc_id_token` / `$oidc_access_token` | 初回認証リクエストのみ | 常に利用可能 | 常に利用可能 |
+| ログアウト時の `id_token_hint` | 付かない | 付く | 付く |
+| `oidc_refresh_token` / `oidc_introspection` | 利用不可 | 利用可能 | 利用可能 |
+| Back-Channel / Front-Channel Logout | 利用不可 | 利用可能 | 利用可能 |
+| 複数ホスト間の共有 | 不可（各ホストが自分で検証） | 不可（ホスト内のみ） | **可能** |
+| NGINX 再起動 | セッション維持 | セッション消失 | セッション維持 |
+| 追加の依存 | なし | 共有メモリのみ | Redis サーバー |
 
-ストアが満杯になると古いセッションから順に追い出されます。1 セッションあたりおよそ「クレーム + 各トークンの長さ + 150 バイト」を消費します。
+共有メモリのストアが満杯になると古いセッションから順に追い出されます。1 セッションあたりおよそ「クレーム + 各トークンの長さ + 150 バイト」を消費します。
+
+Redis を使う場合の注意:
+
+- `/_oidc_redis` ロケーションを定義し、`oidc_redis_pass` で宛先を指定します。`upstream` ブロックを宛先にすれば `keepalive` も使えます。
+- キーは `oidc:s:<セッションID>` で、`oidc_session_timeout` を TTL とした `SETEX` で書き込みます。ログアウト通知から引けるように `oidc:x:sid:<sid>` と `oidc:x:sub:<sub>` のセット（同じ TTL）も維持します。書き込みと一括削除は 1 往復で済むよう `EVAL` の Lua スクリプトで行います。
+- 応答は 1 回の読み取りで収まる必要があります。ID トークンが大きい IdP では `oidc_redis_buffer_size` を増やしてください。
+- Redis に接続できない場合、セッションは「無効」として扱われ再認証になります（フェイルクローズ）。
 
 ### 内部ロケーション
 
@@ -227,6 +268,7 @@ http {
 | `/_oidc_jwks` | `proxy_pass $oidc_jwks_url;` |
 | `/_oidc_userinfo` | `proxy_pass $oidc_userinfo_url;` + `Authorization: $oidc_userinfo_bearer`（`oidc_use_userinfo on` 時のみ） |
 | `/_oidc_introspect` | `proxy_pass $oidc_introspect_url;` + `proxy_method POST;` + `proxy_set_body $oidc_introspect_body;` + `Authorization: $oidc_token_basic`（`oidc_introspection on` 時のみ） |
+| `/_oidc_redis` | `oidc_redis_pass <addr>;`（`oidc_session_store redis` 時のみ） |
 
 `/_oidc_token` で `proxy_set_header Content-Length "";` を指定してはいけません。`proxy_set_body` が設定する Content-Length が消え、リクエストボディが IdP に届かなくなります。
 
@@ -240,6 +282,7 @@ http {
 | `$oidc_claim_<name>` | 任意クレーム（例 `$oidc_claim_groups`, `$oidc_claim_tenant_id`）。配列はカンマ区切りに展開 |
 | `$oidc_access_token` | アクセストークン（Cookie モードでは初回認証リクエストのみ） |
 | `$oidc_id_token` | ID トークン（Cookie モードでは初回認証リクエストのみ） |
+| `$oidc_sid` | ID トークンの `sid` クレーム（IdP 側セッション ID） |
 | `$oidc_discovery_url` | Discovery URL（`/_oidc_discovery` 用） |
 | `$oidc_token_url` | トークンエンドポイント URL（`/_oidc_token` 用） |
 | `$oidc_jwks_url` | JWKS URL（`/_oidc_jwks` 用） |
@@ -302,6 +345,64 @@ http {
 
 `oidc_post_logout_redirect_uri` は IdP 側にも登録が必要です。ログアウト後の戻り先は認証不要にしておいてください（`auth_oidc off;`）。
 
+### ログアウト通知（Back-Channel / Front-Channel）
+
+IdP 側でログアウトしたときに RP のセッションも破棄するための仕組みです。いずれも `oidc_session_store` が必要です（Cookie モードでは 501 を返します）。
+
+**Back-Channel Logout**: IdP が `oidc_backchannel_logout_uri` に `logout_token` を POST します。モジュールは JWKS で署名を検証したうえで、`iss` / `aud` / `iat`（300 秒以内）/ `events` に backchannel-logout イベントがあること / `nonce` が無いこと / `sub` か `sid` があること、を確認してから該当セッションをすべて破棄し 200 を返します。検証に失敗した場合は 400 です。
+
+**Front-Channel Logout**: IdP が `oidc_frontchannel_logout_uri` を hidden iframe で読み込みます。Cookie は `SameSite=Lax` のため第三者コンテキストでは送られてこないので、クエリの `sid` でセッションを特定します。`iss` が付いていればプロバイダと一致することも確認します。
+
+どちらのエンドポイントも認証を要求しません。IdP 側にも登録が必要です。
+
+```nginx
+oidc_backchannel_logout_uri  "https://app.example.com/backchannel-logout";
+oidc_frontchannel_logout_uri "https://app.example.com/frontchannel-logout";
+```
+
+### クライアント認証
+
+| `oidc_client_auth` | 送り方 |
+|---|---|
+| `basic`（既定） | `Authorization: Basic base64(client_id:client_secret)` |
+| `post` | ボディに `client_id` と `client_secret` |
+| `client_secret_jwt` | `client_secret` を鍵に HS256 で署名した client assertion（RFC 7523） |
+| `private_key_jwt` | `oidc_client_jwt_key` の秘密鍵で RS256 署名した client assertion |
+
+client assertion の `aud` はトークンエンドポイントの URL、`exp` は 60 秒後、`jti` は毎回ランダムです。アルゴリズムは `oidc_client_jwt_alg` で変更できます（RS/PS/ES/HS の各 256/384/512）。
+
+```nginx
+oidc_client_auth    private_key_jwt;
+oidc_client_jwt_key /etc/nginx/oidc-client.key;   # PEM 秘密鍵
+oidc_client_jwt_kid "my-key-1";                   # 任意
+```
+
+### 名前付きプロバイダ（`oidc_provider` ブロック）
+
+NGINX Plus の設定に合わせて、http レベルでプロバイダをまとめて定義できます。
+
+```nginx
+http {
+    oidc_provider keycloak {
+        issuer        "https://idp.example.com/realms/myrealm";
+        client_id     "my-client";
+        client_secret "secret";
+        redirect_uri  "https://app.example.com/callback";
+        scope         "openid profile email";
+        userinfo      on;
+    }
+
+    server {
+        location / {
+            auth_oidc keycloak;
+            proxy_pass http://backend;
+        }
+    }
+}
+```
+
+ブロック内で使える名前は `issuer` `client_id` `client_secret` `redirect_uri` `scope` `userinfo` `session_timeout` `logout_uri` `post_logout_redirect_uri` `client_auth` `auth_request_args` です。ロケーション側で同じ項目を設定した場合はロケーションの値が優先されます。
+
 ## トークンの更新と失効確認
 
 `oidc_session_store` が有効なとき、保護対象へのリクエストごとに次を行います。
@@ -325,7 +426,9 @@ http {
 - **SSRF 対策**: `proxy_pass` に渡す URL はモジュールが Discovery 結果から組み立てた変数のみ
 - **upstream の TLS 検証**: NGINX の既定では `proxy_ssl_verify` は off。HTTPS の IdP を使う場合は上記の設定例のとおり必ず有効にすること
 - **`oidc_cookie_secret` 未設定時**: 起動ごとにワーカーがランダムシークレットを生成し `WARN` を出力。Cookie モードのマルチワーカー環境では必ず設定すること（ストアモードでは Cookie に署名しないため不要）
-- **リフレッシュトークンの保管**: リフレッシュトークンは共有メモリのセッションにのみ保持し、Cookie には出さない
+- **リフレッシュトークンの保管**: リフレッシュトークンはサーバー側のセッションにのみ保持し、Cookie には出さない
+- **ログアウトトークンの検証**: Back-Channel Logout のトークンは JWKS で署名を検証し、`iss` / `aud` / `iat` / `events` / `nonce` 不在まで確認する
+- **`private_key_jwt`**: `client_secret` を送らずに済むため、シークレットの配布が不要になる
 - **失効の検知**: `oidc_introspection on` でアクセストークンの失効を検知しセッションを破棄する。イントロスペクションエンドポイントに到達できない場合はセッションを維持し（フェイルオープン）警告ログを出す。タイムスタンプを更新しないため次のリクエストで再試行する
 
 ## テスト
@@ -337,7 +440,7 @@ cd test && npm install && npx playwright install chromium
 NGINX_SRC=/path/to/nginx-1.26.2 ./test/run-e2e.sh
 ```
 
-`run-e2e.sh` はモジュールのビルド、モック IdP 2 台（RS256 / ES256）の起動、NGINX の起動、Playwright の実行、後片付けまでを行い、**セッションストアあり・なしの両方**でテストします。詳細は [TEST_PLAYWRIGHT.md](TEST_PLAYWRIGHT.md) を参照してください。
+`run-e2e.sh` はモジュールのビルド、Redis とモック IdP 2 台（RS256 / ES256）の起動、NGINX の起動、Playwright の実行、後片付けまでを行い、**共有メモリ / Redis / Cookie の 3 通り**でテストします（`redis-server` と `openssl` が必要）。詳細は [TEST_PLAYWRIGHT.md](TEST_PLAYWRIGHT.md) を参照してください。
 
 検証シナリオ:
 
@@ -359,6 +462,10 @@ NGINX_SRC=/path/to/nginx-1.26.2 ./test/run-e2e.sh
 16. アクセストークン失効時のリフレッシュトークンによる自動更新（ストアモード）
 17. イントロスペクションが `active: false` を返したときのセッション破棄（ストアモード）
 18. RP-Initiated Logout（`id_token_hint` と `post_logout_redirect_uri` を含む）
+19. `client_secret_jwt` / `private_key_jwt` によるクライアント認証
+20. `oidc_provider` ブロックを参照するロケーション
+21. Back-Channel Logout（署名不正・`nonce` 付きトークンの拒否を含む）
+22. Front-Channel Logout
 
 ## 実装状況
 
@@ -370,12 +477,12 @@ NGINX_SRC=/path/to/nginx-1.26.2 ./test/run-e2e.sh
 | Phase 4 | ID トークンの署名検証・クレーム検証・セッション Cookie | 完了 |
 | Phase 5 | UserInfo・任意クレーム永続化・SSRF 対策・実モジュール E2E | 完了 |
 | Phase 6 | サーバーサイドセッション・ログアウト・リフレッシュ・イントロスペクション | 完了 |
+| Phase 7 | Redis セッションストア・Back/Front-Channel Logout・JWT クライアント認証・`oidc_provider` ブロック | 完了 |
 
 ### 未実装の機能
 
 | 機能 | 説明 |
 |------|------|
-| Back-Channel / Front-Channel Logout | IdP からの通知でセッションを破棄する方式。現状は RP-Initiated Logout のみ |
-| 外部セッションストア（Redis 等） | 共有メモリはホスト内で共有される。複数ホスト間で共有するには外部ストアが必要 |
-| `private_key_jwt` / `client_secret_jwt` | クライアント認証は `client_secret_basic` と `client_secret_post` のみ |
-| `oidc_provider` ブロック構文 | NGINX Plus モジュールとの設定互換 |
+| Redis Sentinel / Cluster | 単一の宛先（または `upstream` ブロック）のみ。フェイルオーバーは NGINX の upstream 機能に依存 |
+| Pushed Authorization Requests (PAR) / DPoP | 認可リクエストの事前送信やトークンの所有証明 |
+| `mTLS` クライアント認証 | `tls_client_auth` / `self_signed_tls_client_auth` |

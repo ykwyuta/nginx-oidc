@@ -6,6 +6,7 @@
  * - トークンエンドポイントは client_secret_basic のみを受け付ける
  */
 const express = require('express');
+const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
@@ -59,12 +60,18 @@ app.get('/.well-known/openid-configuration', (req, res) => {
     jwks_uri: `${ISSUER}/certs`,
     userinfo_endpoint: `${ISSUER}/userinfo`,
     end_session_endpoint: `${ISSUER}/logout`,
+    backchannel_logout_supported: true,
+    backchannel_logout_session_supported: true,
+    frontchannel_logout_supported: true,
+    frontchannel_logout_session_supported: true,
     introspection_endpoint: `${ISSUER}/introspect`,
     response_types_supported: ['code'],
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: [ALG],
     token_endpoint_auth_methods_supported: ['client_secret_basic',
-                                            'client_secret_post']
+                                            'client_secret_post',
+                                            'client_secret_jwt',
+                                            'private_key_jwt']
   });
 });
 
@@ -165,6 +172,41 @@ function checkClientAuth(req) {
     return { method: 'basic' };
   }
 
+  if (req.body.client_assertion) {
+    if (req.body.client_assertion_type
+        !== 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer') {
+      return { error: 'unexpected client_assertion_type' };
+    }
+
+    const header = JSON.parse(
+      Buffer.from(req.body.client_assertion.split('.')[0], 'base64url')
+        .toString('utf8'));
+
+    const usesSecret = header.alg.startsWith('HS');
+    const key = usesSecret ? CLIENT_SECRET : clientPublicKey;
+
+    if (!key) {
+      return { error: 'no key to verify the client assertion' };
+    }
+
+    try {
+      const claims = jwt.verify(req.body.client_assertion, key, {
+        algorithms: [header.alg],
+        issuer: CLIENT_ID,
+        audience: `${ISSUER}/token`
+      });
+
+      if (claims.sub !== CLIENT_ID || !claims.jti) {
+        return { error: 'malformed client assertion' };
+      }
+
+    } catch (e) {
+      return { error: `client assertion rejected: ${e.message}` };
+    }
+
+    return { method: usesSecret ? 'client_secret_jwt' : 'private_key_jwt' };
+  }
+
   if (req.body.client_id !== undefined || req.body.client_secret !== undefined) {
     if (req.body.client_id !== CLIENT_ID
         || req.body.client_secret !== CLIENT_SECRET) {
@@ -177,6 +219,11 @@ function checkClientAuth(req) {
   return { error: 'no client credentials' };
 }
 
+// private_key_jwt の検証に使うクライアント公開鍵（テストランナーが生成する）
+const clientPublicKey = process.env.MOCK_IDP_CLIENT_PUBKEY
+  ? fs.readFileSync(process.env.MOCK_IDP_CLIENT_PUBKEY, 'utf8')
+  : null;
+
 // 発行済みのアクセストークン: token -> { active }
 const accessTokens = new Map();
 // 発行済みのリフレッシュトークン: token -> context
@@ -184,6 +231,10 @@ const refreshTokens = new Map();
 
 function issueTokens(context, authMethod, refreshed) {
   const now = Math.floor(Date.now() / 1000);
+
+  if (!context.sid) {
+    context.sid = crypto.randomBytes(8).toString('hex');
+  }
 
   const accessToken = crypto.randomBytes(16).toString('hex');
   accessTokens.set(accessToken, { active: true });
@@ -198,6 +249,7 @@ function issueTokens(context, authMethod, refreshed) {
     exp: now + 3600,
     iat: now,
     nonce: context.nonce,
+    sid: context.sid,
     email: 'testuser@example.com',
     // リフレッシュされたことをテストから見えるようにする
     name: refreshed ? 'Test User (refreshed)' : 'Test User',
@@ -302,6 +354,31 @@ app.get('/logout', (req, res) => {
   }
 
   res.send('<html><body><h1>Logged out</h1></body></html>');
+});
+
+/*
+ * テスト用: Back-Channel Logout のロゴアウトトークンを発行する。
+ * 実際の IdP は RP のエンドポイントへ自分で POST するが、テストからは
+ * トークンだけ受け取って任意の RP へ POST できた方が扱いやすい。
+ */
+app.get('/test/logout_token', (req, res) => {
+  const now = Math.floor(Date.now() / 1000);
+  const claims = {
+    iss: ISSUER,
+    aud: CLIENT_ID,
+    iat: now,
+    jti: crypto.randomBytes(8).toString('hex'),
+    events: { 'http://schemas.openid.net/event/backchannel-logout': {} }
+  };
+
+  if (req.query.sub) { claims.sub = req.query.sub; }
+  if (req.query.sid) { claims.sid = req.query.sid; }
+  if (req.query.nonce) { claims.nonce = req.query.nonce; }
+
+  const key = req.query.bad_sig === '1' ? rogueKey : privateKey;
+
+  res.type('text/plain').send(
+    jwt.sign(claims, key, { algorithm: ALG, keyid: kid }));
 });
 
 /* テスト用: 発行済みのアクセストークンをすべて失効させる */

@@ -47,7 +47,7 @@ typedef struct {
     ngx_str_t userinfo_endpoint;       /* 任意 */
 } ngx_http_oidc_provider_metadata_t;
 
-/* 共有メモリ上のセッション（oidc_session_store 有効時） */
+/* 共有メモリ上のセッション（oidc_session_store <size> のとき） */
 typedef struct {
     ngx_rbtree_node_t  node;          /* node.key = セッション ID の crc32 */
     ngx_queue_t        queue;         /* LRU */
@@ -56,11 +56,10 @@ typedef struct {
     time_t             access_expires;
     time_t             introspected;
     u_char             sid[64];
-    u_short            id_token_len;
-    u_short            access_token_len;
-    u_short            refresh_token_len;
-    u_short            claims_len;
-    u_char             data[1];       /* claims || id_token || access || refresh */
+    u_short            record_len;
+    u_short            sub_len;
+    u_short            oidc_sid_len;
+    u_char             data[1];       /* record || sub || oidc_sid */
 } ngx_http_oidc_sess_t;
 
 /* ロケーション単位の Discovery キャッシュ */
@@ -137,6 +136,10 @@ typedef struct {
 - **内部ロケーションへ渡す値はすべてリクエストコンテキスト**に置き、変数ハンドラは `r->main` の ctx を読む。main conf に置くとリクエストをまたいで競合し、SSRF 対策としても不正確になる。
 - **セッションの保存先は 2 通り**。既定ではクレームを HMAC 署名付き Cookie に載せる（ステートレス）。`oidc_session_store` を設定すると共有メモリの rbtree + LRU キューに保持し、Cookie には 256 bit の乱数 ID だけを載せる。ID トークン・アクセストークン・リフレッシュトークンは Cookie に載せるには大きすぎ、リフレッシュトークンはクライアントに渡すべきでないため、ログアウトの `id_token_hint`・トークン更新・イントロスペクションはストアモードを前提とする。
 - **ストアの排他**は `ngx_slab_pool_t` のミューテックスで行い、ロード時はリクエストプールにコピーしてすぐロックを外す。満杯のときは期限切れ、次いで LRU の末尾から追い出す。
+- **Redis ストア**では、セッションの読み書き自体が非同期になる。アクセスハンドラは `ngx_http_oidc_load_session()` から `NGX_AGAIN` を受け取って待機し、`/_oidc_redis` サブリクエストの完了ハンドラが `ctx->redis_after` に従って続きを実行する（ログイン完了・ログアウトの 302・リフレッシュ後の再開・単なる再開）。
+- **セッションのシリアライズ形式**は共有メモリと Redis で共通:
+  `1|issued|access_expires|introspected|B64(id)|B64(at)|B64(rt)|B64(sid)|claims`
+  クレーム列自体が `|` を含むため末尾に置く。
 
 ---
 
@@ -206,6 +209,19 @@ typedef struct {
 Discovery だけはアクセスハンドラ自身から発行するため、完了時に `done` を立てず `waiting` を下ろすだけで、親はそのままフェーズを続行してキャッシュ済みメタデータで処理を進めます。
 
 ---
+
+## Redis クライアント
+
+`oidc_session_store redis;` を指定すると、セッションは `/_oidc_redis` 内部ロケーション経由で Redis に置かれる。このロケーションのコンテンツハンドラは NGINX の upstream フレームワーク上に実装した最小の RESP クライアントで、`ngx_http_memcached_module` と同じ作りになっている。
+
+- 送るコマンドはリクエストコンテキストの `ctx->redis_cmd`（RESP 配列）。`oidc_redis_password` / `oidc_redis_database` が設定されていれば `AUTH` / `SELECT` を前置し、その分の応答は読み飛ばす。
+- 応答は「単純文字列 `+`」「整数 `:`」「バルク `$`」「nil `$-1`」「エラー `-`」だけを解釈する。配列は返らない（下記のとおり複数キー操作は Lua 側で完結させている）。
+- `process_header` は**応答全体がバッファに収まるまで `NGX_AGAIN` を返す**。これで本文の取り回しが不要になり、値をコピーしたあと NGINX がバッファをリセットしても問題がない。応答が入りきらない場合は `oidc_redis_buffer_size` を増やす。
+- 応答の長さは `input_filter_init` で `u->length` に設定する。`ngx_http_upstream_process_headers()` が `u->length` を -1 に戻すため、`process_header` で設定しても上書きされてしまう（設定し忘れるとリクエストが読み取りタイムアウトまで終わらない）。
+- 使うコマンドは 3 つだけ:
+  - `GET oidc:s:<sid>`
+  - `DEL oidc:s:<sid>`
+  - `EVAL <script> ...` — 保存（`SETEX` + 2 つのインデックス集合の `SADD`/`EXPIRE`）と、ログアウト通知による一括削除（`SMEMBERS` してから `DEL`）。どちらも 1 往復で終わり、戻り値は整数なので配列のパースが不要になる。
 
 ## 主要関数の解説
 
@@ -280,6 +296,27 @@ ID トークンと UserInfo のクレームを取り込みます。文字列・�
 
 セッションを破棄して Cookie を消し、IdP の `end_session_endpoint` へ `client_id`・`id_token_hint`（ストアモードのみ）・`post_logout_redirect_uri` を付けてリダイレクトします。`end_session_endpoint` が無い IdP ではローカルのセッションだけを消して `oidc_post_logout_redirect_uri` へ戻します。
 
+### Back-Channel / Front-Channel Logout
+
+どちらも IdP からの通知であり、Cookie ではなく `sub` / `sid` でセッションを特定するため、サーバー側ストアが前提になります（Cookie モードでは 501）。
+
+- `ngx_http_oidc_backchannel_logout()` は POST ボディを読み（アクセスフェーズから `ngx_http_read_client_request_body()` を呼び、完了ハンドラで `r->main->count--` してからフェーズを再開する）、`logout_token` を取り出して `OIDC_PHASE_BACKCHANNEL` で JWKS 検証に流します。`ngx_http_oidc_validate_logout_token()` が OIDC Back-Channel Logout 1.0 2.6 の条件（`iss` / `aud` / `iat` が 300 秒以内 / `events` に backchannel-logout / `nonce` が無いこと / `sub` か `sid` があること）を確認し、`ngx_http_oidc_purge_sessions()` で該当セッションを削除します。
+- `ngx_http_oidc_frontchannel_logout()` はクエリの `iss` と `sid` だけで動きます。iframe から呼ばれるため Cookie は届かない前提です。
+- 共有メモリでは LRU キューを線形に走査して `sub` / `sid` が一致するセッションを消します（ログアウトは頻度が低いので二次インデックスは持ちません）。Redis では `oidc:x:sid:` / `oidc:x:sub:` の集合を Lua スクリプトで辿って削除します。
+- どちらも本文なしの 200 を返します（`ngx_http_oidc_send_empty_ok()`）。
+
+### クライアント認証
+
+`ngx_http_oidc_client_assertion()` が `client_secret_jwt` / `private_key_jwt` の client assertion（RFC 7523 2.2）を libjwt で組み立てます。`iss` と `sub` は `client_id`、`aud` はトークンエンドポイント、`jti` は毎回ランダム、`exp` は 60 秒後です。鍵は `private_key_jwt` なら `oidc_client_jwt_key` で読み込んだ PEM、`client_secret_jwt` なら `oidc_client_secret` です。
+
+アルゴリズムの既定値はマージ時ではなくリクエスト時に決めています。マージ時に既定値を書き込むと、親（`client_secret_basic`）の既定 HS256 が、`private_key_jwt` を指定した子ロケーションに継承されてしまうためです。
+
+### `oidc_provider` ブロック
+
+http レベルの `oidc_provider <name> { ... }` は、`ngx_http_oidc_create_loc_conf()` で作った設定に短い名前のディレクティブ（`issuer`, `client_id`, ...）を書き込み、名前付きプリセットとして main conf に保存します。`auth_oidc <name>;` を書いたロケーションは、マージ時に `ngx_http_oidc_apply_provider()` が未設定の項目だけをプリセットから埋めます。
+
+引数に `://` を含む場合は従来どおりの `oidc_provider <url>;` として扱います。ブロックの解析中は `cf->args` が使い回されるため、名前は `ngx_conf_parse()` を呼ぶ前に控えておく必要があります。
+
 ### `ngx_http_oidc_userinfo_handler`（行 2206 付近）
 
 UserInfo レスポンスの `sub` が ID トークンの `sub` と一致することを確認してからクレームをマージします（OIDC Core 5.3.2）。UserInfo の失敗は致命的ではなく、ID トークンのクレームだけでセッションを発行します。
@@ -346,7 +383,6 @@ UserInfo の失敗のみ非致命的（警告ログを出して ID トークン�
 
 | 機能 | 説明 |
 |------|------|
-| Back-Channel / Front-Channel Logout | IdP からの通知でセッションを破棄する方式。現状は RP-Initiated Logout のみ |
-| 外部セッションストア（Redis 等） | 共有メモリはホスト内で共有される。複数ホスト間で共有するには外部ストアが必要 |
-| `private_key_jwt` / `client_secret_jwt` | クライアント認証は `client_secret_basic` と `client_secret_post` のみ |
-| `oidc_provider` ブロック構文 | NGINX Plus モジュールとの設定互換 |
+| Redis Sentinel / Cluster | 宛先は単一（または `upstream` ブロック）。フェイルオーバーは NGINX の upstream 機能に委ねている |
+| Pushed Authorization Requests (PAR) / DPoP | 認可リクエストの事前送信、トークンの所有証明 |
+| mTLS クライアント認証 | `tls_client_auth` / `self_signed_tls_client_auth` |

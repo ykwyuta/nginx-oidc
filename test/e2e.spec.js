@@ -3,8 +3,8 @@ const { test, expect } = require('@playwright/test');
 const BASE = process.env.OIDC_TEST_BASE_URL || 'http://localhost:8080';
 
 // run-e2e.sh はストアあり (store) と Cookie のみ (cookie) の両方で実行する
-const MODE = process.env.OIDC_TEST_MODE || 'store';
-const STORE = MODE === 'store';
+const MODE = process.env.OIDC_TEST_MODE || 'store';   // store | redis | cookie
+const STORE = MODE !== 'cookie';
 
 /** IdP の認可 URL にテスト用フラグを足してログインする */
 async function loginWithFlag(page, target, flag) {
@@ -296,6 +296,125 @@ test.describe('NGINX OIDC module (real dynamic module)', () => {
     expect(session).toBeFalsy();
 
     // セッションが消えているので再度ログインを求められる
+    await page.goto(target);
+    await expect(page.locator('h1')).toContainText('Mock IdP Login');
+  });
+
+  test('authenticates the client with client_secret_jwt', async ({ page }) => {
+    const target = `${BASE}/csjwt/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    expect(body.token_auth).toBe('client_secret_jwt');
+  });
+
+  test('authenticates the client with private_key_jwt', async ({ page }) => {
+    const target = `${BASE}/pkjwt/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    expect(body.token_auth).toBe('private_key_jwt');
+  });
+
+  test('uses a named oidc_provider block', async ({ page }) => {
+    const target = `${BASE}/preset/page`;
+
+    await page.goto(target);
+    const url = new URL(page.url());
+    expect(url.searchParams.get('client_id')).toBe('test-client-id');
+    expect(url.searchParams.get('redirect_uri'))
+      .toBe(`${BASE}/preset/callback`);
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      page.click('button#login-button')
+    ]);
+
+    const body = await response.json();
+    expect(body.sub).toBe('user-123');
+    // userinfo on; がブロックから継承されている
+    expect(body.groups).toBe('admin,user');
+  });
+
+  test('handles back-channel logout', async ({ page, request }) => {
+    test.skip(!STORE, 'back-channel logout needs a session store');
+
+    const target = `${BASE}/session/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const sid = (await response.json()).sid;
+    expect(sid).toBeTruthy();
+
+    const tokenResp = await request.get(
+      `http://127.0.0.1:3000/test/logout_token?sid=${sid}`);
+    const logoutToken = await tokenResp.text();
+
+    const posted = await request.post(`${BASE}/session/backchannel-logout`, {
+      form: { logout_token: logoutToken }
+    });
+    expect(posted.status()).toBe(200);
+
+    // セッションが消えているので再ログインを求められる
+    await page.goto(target);
+    await expect(page.locator('h1')).toContainText('Mock IdP Login');
+  });
+
+  test('rejects a logout token that is not signed by the provider',
+       async ({ request }) => {
+    test.skip(!STORE, 'back-channel logout needs a session store');
+
+    const tokenResp = await request.get(
+      'http://127.0.0.1:3000/test/logout_token?sub=user-123&bad_sig=1');
+
+    const posted = await request.post(`${BASE}/session/backchannel-logout`, {
+      form: { logout_token: await tokenResp.text() }
+    });
+    expect(posted.status()).toBe(400);
+  });
+
+  test('rejects a logout token that carries a nonce', async ({ request }) => {
+    test.skip(!STORE, 'back-channel logout needs a session store');
+
+    const tokenResp = await request.get(
+      'http://127.0.0.1:3000/test/logout_token?sub=user-123&nonce=abc');
+
+    const posted = await request.post(`${BASE}/session/backchannel-logout`, {
+      form: { logout_token: await tokenResp.text() }
+    });
+    expect(posted.status()).toBe(400);
+  });
+
+  test('handles front-channel logout', async ({ page, request }) => {
+    test.skip(!STORE, 'front-channel logout needs a session store');
+
+    const target = `${BASE}/session/page`;
+
+    const [response] = await Promise.all([
+      page.waitForResponse(resp => resp.url() === target && resp.status() === 200),
+      loginWithFlag(page, target, null)
+    ]);
+
+    const sid = (await response.json()).sid;
+
+    const iframe = await request.get(
+      `${BASE}/session/frontchannel-logout`
+      + `?iss=${encodeURIComponent('http://127.0.0.1:3000')}&sid=${sid}`);
+    expect(iframe.status()).toBe(200);
+
     await page.goto(target);
     await expect(page.locator('h1')).toContainText('Mock IdP Login');
   });

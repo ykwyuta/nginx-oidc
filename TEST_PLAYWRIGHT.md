@@ -8,6 +8,8 @@
 * **npm**
 * **NGINX のソース**（`--with-compat --add-dynamic-module=` でモジュールをビルドするため）
 * **依存ライブラリ**: `libssl-dev`, `libjansson-dev`, `libjwt-dev`
+* **redis-server** と **redis-cli**（Redis ストアのテスト用）
+* **openssl** コマンド（`private_key_jwt` 用のクライアント鍵生成）
 
 ```bash
 apt-get install libssl-dev libjansson-dev libjwt-dev
@@ -33,16 +35,18 @@ NGINX_SRC=/path/to/nginx-1.26.2 ./test/run-e2e.sh
 1. `NGINX_SRC` でモジュールと nginx をビルド
 2. 作業ディレクトリ `test/.e2e` に prefix を作成し、`test/nginx.conf` の `load_module` をビルド結果のパスに差し替え
 3. `nginx -t` で設定を検証
-4. モック IdP を 2 台起動
+4. `private_key_jwt` 用の RSA 鍵ペアを生成し、Redis をポート 6399 で起動
+5. モック IdP を 2 台起動
    * ポート 3000: RS256 で署名（クライアント `test-client-id`）
    * ポート 3001: ES256 で署名（クライアント `tenant-b-client`）
-5. NGINX を起動（8080 が保護対象、8081 がクレームを返すバックエンド）
-6. `npx playwright test` を **2 回** 実行する
-   * `store`: `oidc_session_store` を有効にした構成
+6. NGINX を起動（8080 が保護対象、8081 がクレームを返すバックエンド）
+7. `npx playwright test` を **3 回** 実行する
+   * `store`: `oidc_session_store 4m;`（共有メモリ）
+   * `redis`: `oidc_session_store redis;`
    * `cookie`: `oidc_session_store` を無効にした構成（クレームを Cookie に載せる）
-7. 失敗時は `nginx` と IdP のログを表示し、最後に必ず後片付け
+8. 失敗時は `nginx` / IdP / Redis のログを表示し、最後に必ず後片付け
 
-セッションストアを前提とする機能（`$oidc_id_token` の継続利用、リフレッシュ、イントロスペクション）のテストは `cookie` モードではスキップされます。
+サーバー側ストアを前提とする機能（`$oidc_id_token` の継続利用、リフレッシュ、イントロスペクション、Back/Front-Channel Logout）のテストは `cookie` モードではスキップされます。
 
 ビルド済みのバイナリを使う場合は `NGINX_SRC` の代わりに以下を指定します。
 
@@ -73,6 +77,13 @@ Chromium が Playwright の既定の場所にない場合は `PLAYWRIGHT_CHROMIU
 | 12 | リフレッシュ | `expires_in=1` のアクセストークンが失効した後のリクエストで、リフレッシュトークンによる更新が行われ、更新後の ID トークン由来のクレームになること |
 | 13 | イントロスペクション | IdP 側でアクセストークンを失効させると、`oidc_introspection_interval` 経過後のリクエストでセッションが破棄され再認証になること |
 | 14 | ログアウト | `/session/logout` が IdP の `end_session_endpoint` を経由して `post_logout_redirect_uri` へ戻り、セッション Cookie が消え、再度ログインを求められること |
+| 15 | client_secret_jwt | `/csjwt/` のログインで、モック IdP が HS256 の client assertion を検証できること |
+| 16 | private_key_jwt | `/pkjwt/` のログインで、モック IdP が RSA 公開鍵で client assertion を検証できること |
+| 17 | プロバイダブロック | `auth_oidc test-idp;` のロケーションが、ブロックの `client_id` / `redirect_uri` / `userinfo` を継承すること |
+| 18 | Back-Channel Logout | ログイン後に `sid` 宛の logout token を POST すると 200 が返り、セッションが消えること |
+| 19 | 不正な logout token | JWKS にない鍵で署名した logout token が 400 で拒否されること |
+| 20 | nonce 付き logout token | `nonce` を含む logout token が 400 で拒否されること |
+| 21 | Front-Channel Logout | `iss` と `sid` 付きの GET で 200 が返り、セッションが消えること |
 
 シナリオ 4・5・7 のために、モック IdP は次のテスト用フラグを持ちます。
 
@@ -82,7 +93,10 @@ Chromium が Playwright の既定の場所にない場合は `PLAYWRIGHT_CHROMIU
 * `MOCK_IDP_ALG=ES256` で EC 鍵による署名に切り替える
 * `POST /test/revoke` で発行済みのアクセストークンをすべて失効させる（イントロスペクションが `active: false` を返すようになる）
 * リフレッシュで発行した ID トークンは `name` を `Test User (refreshed)` にするため、更新が起きたことをテストから判別できる
-* ID トークンに `token_auth` クレーム（`basic` / `post`）を入れ、使われたクライアント認証方式を判別できる
+* ID トークンに `token_auth` クレーム（`basic` / `post` / `client_secret_jwt` / `private_key_jwt`）を入れ、使われたクライアント認証方式を判別できる
+* ID トークンに `sid` クレームを入れ、ログアウト通知の対象をテストから指定できる
+* `GET /test/logout_token?sid=...&sub=...&nonce=...&bad_sig=1` で Back-Channel Logout 用のトークンを発行する
+* `MOCK_IDP_CLIENT_PUBKEY` に公開鍵のパスを渡すと `private_key_jwt` を検証する
 
 モック IdP のトークンエンドポイントは `client_secret_basic` のみを受け付け、クエリパラメータが付いたリクエストを 400 で拒否します。これにより、認可コードや `client_secret` が URL に載っていないことがテストで担保されます。
 
@@ -106,6 +120,6 @@ cd test && npx playwright test
 | `test/run-e2e.sh` | ビルドから後片付けまでを行うテストランナー |
 | `test/e2e.spec.js` | Playwright の E2E テスト |
 | `test/mock-idp.js` | モック OpenID Provider（RS256 / ES256、client_secret_basic、PKCE 検証） |
-| `test/nginx.conf` | テスト用 NGINX 設定（保護対象・短命セッション・別プロバイダ・ログアウト/更新/失効確認・バックエンド） |
+| `test/nginx.conf` | テスト用 NGINX 設定（保護対象・短命セッション・別プロバイダ・ログアウト/更新/失効確認・JWT クライアント認証・プロバイダブロック・バックエンド） |
 | `test/playwright.config.js` | Playwright 設定 |
 | `test/package.json` | Node.js 依存パッケージ |

@@ -6,6 +6,7 @@
 - 初回検証: 2026-09-01（対象コミット `0f0719a`）— 致命的欠陥 3 件を含む 16 件を検出
 - 修正後の再検証: 2026-09-01 — 検出した全件を修正し、実モジュールに対する E2E 8 シナリオが通過
 - 追加機能の実装後: 2026-09-01 — 未実装として残っていた機能を実装し、E2E 14 シナリオ（ストアモード）/ 11 シナリオ（Cookie モード）が通過
+- 残機能の実装後: 2026-09-01 — Redis ストア・Back/Front-Channel Logout・JWT クライアント認証・`oidc_provider` ブロックを実装し、E2E 21 シナリオが共有メモリ / Redis の両モードで通過（Cookie モードは 14 通過・7 スキップ）
 
 ---
 
@@ -158,11 +159,46 @@ OIDC: ID token aud does not contain oidc_client_id
 - ログアウトの `Location` に `client_id` / `id_token_hint` / `post_logout_redirect_uri` が含まれること
 - アクセスログ・エラーログに `client_secret` / `code_verifier` / トークン類が残らないこと（0 件）、`[alert]` / `[crit]` が 0 件であること
 
-## 5. 残タスク
+## 5. 残機能の実装
+
+| 機能 | 実装内容 |
+|------|---------|
+| **Redis セッションストア** | `oidc_session_store redis;` と `/_oidc_redis` ロケーション（`oidc_redis_pass`）を追加。NGINX の upstream フレームワーク上に最小の RESP クライアントを実装した（`ngx_http_memcached_module` と同じ作り）。セッションの読み書きが非同期になるため、アクセスハンドラは `NGX_AGAIN` で待機し、完了ハンドラが `ctx->redis_after` に従って続き（ログイン完了 / ログアウトの 302 / リフレッシュ後の再開 / 単なる再開）を実行する。保存とログアウト時の一括削除は `EVAL` の Lua スクリプトで 1 往復にまとめ、配列応答のパースを不要にした。AUTH / SELECT にも対応 |
+| **Back-Channel Logout** | `oidc_backchannel_logout_uri` を追加。POST ボディの `logout_token` を JWKS で検証し、OIDC Back-Channel Logout 1.0 2.6 の条件（`iss` / `aud` / `iat` 300 秒以内 / `events` に backchannel-logout / `nonce` 不在 / `sub` か `sid` あり）を確認してから該当セッションを破棄し 200 を返す |
+| **Front-Channel Logout** | `oidc_frontchannel_logout_uri` を追加。iframe から呼ばれ Cookie が届かない前提で、クエリの `sid`（と任意の `iss`）だけでセッションを特定する |
+| **`client_secret_jwt` / `private_key_jwt`** | `oidc_client_auth` に 2 つの方式を追加し、`oidc_client_jwt_key` / `oidc_client_jwt_kid` / `oidc_client_jwt_alg` を新設。libjwt で RFC 7523 の client assertion を組み立てる |
+| **`oidc_provider` ブロック** | http レベルの `oidc_provider <name> { issuer ...; client_id ...; }` と `auth_oidc <name>;` を追加（NGINX Plus 互換）。引数が URL の場合は従来の `oidc_provider <url>;` として扱い、後方互換を保つ |
+
+セッションを引くために `sub` と ID トークンの `sid` クレームを保持する必要が生じたため、共有メモリのエントリと Redis のレコードを共通のシリアライズ形式に統一し、ログアウト通知からの検索は共有メモリでは LRU の線形走査、Redis では `oidc:x:sid:` / `oidc:x:sub:` の集合で行うようにした。
+
+### 実装中に判明した問題
+
+| 問題 | 対処 |
+|------|------|
+| `nginx -t` が segfault | `ngx_http_upstream_hide_headers_hash()` を `hide_headers` が `NGX_CONF_UNSET_PTR` でない状態で呼んでいた。memcached モジュールと同じくこの呼び出し自体が不要だったため削除 |
+| `oidc_provider` ブロックの名前が壊れる | `ngx_conf_parse()` がブロックを解析する間に `cf->args` が使い回されるため、名前を解析前に控えるよう修正 |
+| `private_key_jwt` が HS256 で署名されていた | アルゴリズムの既定値をマージ時に書き込んでいたため、親の `client_secret_basic` 由来の HS256 が子ロケーションに継承されていた。既定値の決定をリクエスト時に移動 |
+| Redis の応答ごとに 5 秒待たされる | `ngx_http_upstream_process_headers()` が `u->length` を -1 に戻すため、`process_header` で設定した長さが失われ読み取りタイムアウトまで終わらなかった。memcached と同じく `input_filter_init` で設定するよう修正 |
+| Front-Channel Logout が 400 | `ngx_http_arg()` はパーセントエンコードされたままの値を返すため、`iss` を復号してから比較するよう修正 |
+
+### 再検証
+
+```
+==> running the Playwright tests (session mode: store)
+  21 passed
+==> running the Playwright tests (session mode: redis)
+  21 passed
+==> running the Playwright tests (session mode: cookie)
+  7 skipped
+  14 passed
+```
+
+`-Werror` を含む既定のフラグでビルド警告ゼロ。アクセスログ・エラーログに `client_secret` / `code_verifier` / トークン類の出現は 0 件、`[alert]` / `[crit]` / `upstream timed out` も 0 件。
+
+## 6. 残タスク
 
 | 機能 | 説明 |
 |------|------|
-| Back-Channel / Front-Channel Logout | IdP からの通知でセッションを破棄する方式。現状は RP-Initiated Logout のみ |
-| 外部セッションストア（Redis 等） | 共有メモリはホスト内で共有される。複数ホスト間で共有するには外部ストアが必要 |
-| `private_key_jwt` / `client_secret_jwt` | クライアント認証は `client_secret_basic` と `client_secret_post` のみ |
-| `oidc_provider` ブロック構文 | NGINX Plus モジュールとの設定互換 |
+| Redis Sentinel / Cluster | 宛先は単一（または `upstream` ブロック）。フェイルオーバーは NGINX の upstream 機能に委ねている |
+| Pushed Authorization Requests (PAR) / DPoP | 認可リクエストの事前送信、トークンの所有証明 |
+| mTLS クライアント認証 | `tls_client_auth` / `self_signed_tls_client_auth` |
